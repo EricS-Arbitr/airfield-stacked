@@ -1,0 +1,176 @@
+---
+# --- System hostname ------------------------------------------------------
+# AIRFIELD OVERLAY, added 2026-08-12. The base role writes an /etc/hosts entry
+# naming inventory_hostname but never sets the actual system hostname, so each
+# Linux host keeps whatever its image booted with. That is usually right --
+# the platform sets it from the blueprint VM name -- until it is not.
+#
+# A host that boots as `localhost` is invisible in the SIEM. rsyslog stamps
+# the system hostname into every message's HOSTNAME field, so the central
+# collector files 100% of that host's syslog under /var/log/remote/localhost/
+# and no directory under the host's real name ever exists. The failure is
+# silent -- the events arrive, they are simply attributed to a name nobody
+# recognises (~169k of them before this was caught, 2026-08-12).
+#
+# Set it explicitly. The /etc/hosts task below then agrees with reality rather
+# than asserting something the system does not believe.
+- name: System hostname matches inventory
+  ansible.builtin.hostname:
+    name: "{{ inventory_hostname }}"
+  register: common_hostname
+
+# rsyslog reads the hostname ONCE, at startup, and stamps it into every
+# message it forwards. Changing the hostname without restarting it leaves
+# every subsequent message labelled with the OLD name until the next reboot --
+# so the fix would appear to have worked while changing nothing observable.
+- name: Restart rsyslog so forwarded messages carry the new hostname
+  ansible.builtin.service:
+    name: rsyslog
+    state: restarted
+  when: common_hostname is changed
+  register: common_rsyslog
+  # Tolerate images with no rsyslog; fail on anything else. Same shape as the
+  # so-firewall 'already exists' tolerance -- name the acceptable failure
+  # rather than blanket-ignoring, or a real error rides through silently.
+  failed_when:
+    - common_rsyslog is failed
+    - "'Could not find the requested service' not in (common_rsyslog.msg | default(''))"
+
+- name: Configure hosts file
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    regexp: '^127\.0\.0\.1'
+    line: "127.0.0.1 localhost {{ inventory_hostname }}"
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Remove localhost.localdomain entry
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    regexp: '^127\.0\.1\.1'
+    state: absent
+
+- name: Ensure NetworkManager is installed
+  ansible.builtin.package:
+    name: network-manager
+    state: present
+
+- name: Set Resolv.conf
+  ansible.builtin.template:
+    src: resolv.conf.j2
+    dest: /etc/resolv.conf
+  loop: "{{ network_interfaces }}"
+  when: item.dns is defined
+
+- name: Configure NetworkManager settings
+  community.general.ini_file:
+    path: /etc/NetworkManager/NetworkManager.conf
+    state: present
+    no_extra_spaces: true
+    section: main
+    option: "{{ item.option }}"
+    value: "{{ item.value }}"
+    owner: root
+    group: root
+    mode: '0644'
+    backup: true
+  loop:
+    - { option: 'plugins', value: 'keyfile' }
+    - { option: 'dns', value: 'default' }
+    - { option: 'renderer', value: 'NetworkManager' }
+
+- name: Start NetworkManager service (coexists with systemd-networkd initially)
+  ansible.builtin.systemd:
+    name: NetworkManager
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Configure NetworkManager connections while systemd-networkd is still active
+  block:
+    - name: Try configuring NetworkManager connections
+      community.general.nmcli:
+        conn_name: "{{ item.name }}"
+        ifname: "{{ item.name }}"
+        type: "{{ item.ipv4.type }}"
+        ip4: "{{ item.ipv4.address }}/{{ (item.ipv4.address ~ '/' ~ item.ipv4.netmask) | ipaddr('prefix') }}"
+        gw4: "{{ item.ipv4.gateway | default(omit) }}"
+        dns4: "{{ item.dns | join(',') if item.dns is defined else omit }}"
+        state: present
+        autoconnect: true
+        method4: manual
+      loop: "{{ network_interfaces }}"
+      register: nmcli_config
+  rescue:
+    - name: Pause before retry
+      ansible.builtin.pause:
+        seconds: 5
+
+    - name: Retry configuring NetworkManager connections
+      community.general.nmcli:
+        conn_name: "{{ item.name }}"
+        ifname: "{{ item.name }}"
+        type: "{{ item.ipv4.type }}"
+        ip4: "{{ item.ipv4.address }}/{{ (item.ipv4.address ~ '/' ~ item.ipv4.netmask) | ipaddr('prefix') }}"
+        gw4: "{{ item.ipv4.gateway | default(omit) }}"
+        dns4: "{{ item.dns | join(',') if item.dns is defined else omit }}"
+        state: present
+        autoconnect: true
+        method4: manual
+      loop: "{{ network_interfaces }}"
+
+- name: Perform network service cutover
+  block:
+    - name: Stop systemd-networkd services asynchronously
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: stopped
+        enabled: false
+      loop:
+        - systemd-networkd
+        - systemd-networkd.socket
+        - systemd-networkd-wait-online
+        - systemd-resolved
+        - networkd-dispatcher
+        - cloud-init
+      async: 30
+      poll: 0
+      register: stop_services
+      ignore_errors: true
+
+- name: Wait for network connectivity to stabilize
+  ansible.builtin.wait_for_connection:
+    delay: 5
+    timeout: 60
+
+- name: Ensure all network connections are active
+  community.general.nmcli:
+    conn_name: "{{ item.name }}"
+    state: present
+    autoconnect: true
+  loop: "{{ network_interfaces }}"
+
+- name: update netplan config
+  ansible.builtin.copy:
+    src: 99-netcfg-vmware.yaml
+    dest: /etc/netplan/99-netcfg-vmware.yaml
+  register: netplan_config
+
+- name: Clean up legacy network configuration files
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/network/interfaces
+    - /etc/network/interfaces.d
+  ignore_errors: true
+
+- name: Gather Package Facts
+  ansible.builtin.package_facts:
+    manager: auto
+
+- name: reboot when changed
+  ansible.builtin.reboot:
+  when: netplan_config.changed
+

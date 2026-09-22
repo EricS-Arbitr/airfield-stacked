@@ -1,0 +1,35 @@
+---
+# ============================================================
+# linux.yml — SSH connection settings + Linux-wide installers
+# ============================================================
+ansible_connection: ssh
+ansible_user: simspace
+ansible_ssh_pass: simspace1
+ansible_become_method: sudo
+ansible_become_pass: simspace1
+ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+
+staging_dir_linux: "/var/tmp"
+cert_dir_linux: "/usr/local/share/ca-certificates"
+ansible_installers: "/var/share/installers/"
+
+# --- Range agent bootstrap (common role) ---------------------
+range_agent_bootstrap: range-agent-bootstrap_linux_amd64.deb
+range_agent_bootstrap_installer: "https://nexus.dev.ng.simspace.lan/repository/ng_raw/installers/range-agent-bootstrap/{{ range_agent_bootstrap }}"
+
+# --- Wazuh agent (Linux) -------------------------------------
+wazuh_agent_installer: "https://nexus.dev.ng.simspace.lan/repository/ng_raw/installers/wazuh/wazuh-agent_amd64.deb"
+
+# --- EDR (use whichever the customer selects per host) -------
+
+# --- Splunk (distributed tier + Linux forwarders) -------------------------
+# Same Nexus paths and same pinned versions as ss-pp-stacked, which is the
+# working distributed reference. Versions are deliberately NOT floating: the
+# forwarder .deb is 9.4.1 and the Windows .msi is 8.2.6, and they differ
+# because that is what is published, not by design.
+splunk_license: "https://nexus.dev.ng.simspace.lan/repository/ng_raw/licenses/splunk/splunk.license"
+splunk_server_installer: "https://nexus.dev.ng.simspace.lan/repository/ng_raw/installers/Splunk/server/splunk.deb"
+splunk_forwarder_installer_deb: "https://nexus.dev.ng.simspace.lan/repository/ng_raw/installers/Splunk/Forwarder/9.4.1/splunkfwd.deb"
+
+cs_linux_installer: "https://nexus.dev.ng.simspace.lan/repository/ng_raw/installers/Crowdstrike/UbuntuSensor.deb"
+s1_linux_installer: "https://nexus.dev.ng.simspace.lan/repository/ng_raw/installers/sentinelone/SentinelAgent.deb"

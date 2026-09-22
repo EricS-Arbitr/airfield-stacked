@@ -1,0 +1,60 @@
+### Managed by Ansible — roles/splunk_cluster_manager. Do not edit on a peer.
+#
+# INDEX-TIME parsing for the Security Onion sourcetypes, pushed to the PEERS
+# via the cluster bundle.
+#
+# WHY HERE AND NOT ON THE SEARCH HEAD. Timestamp recognition, line breaking and
+# truncation are index-time: they run on the indexers as events arrive, and the
+# result is baked into the bucket. Put TIME_FORMAT on the search head and it
+# does nothing, while every event silently lands with the wrong _time and
+# cannot be repaired without re-indexing. KV_MODE and field aliases are the
+# opposite -- search-time, and they live in the arbitr_so_sourcetypes app on
+# the search head.
+#
+# FORMATS MEASURED ON THE LIVE RANGE 2026-09-04, not taken from documentation:
+#   zeek      {"ts":1788555594.513135,"uid":"CU2SRA2esKDLOQhPc7",...}
+#   suricata  {"timestamp":"2026-09-04T20:07:11.412709+0000","flow_id":...}
+#   strelka   file was 0 bytes -- see the note on that stanza
+
+[zeek:json]
+SHOULD_LINEMERGE = false
+LINE_BREAKER = ([\r\n]+)
+TRUNCATE = 0
+# Epoch seconds with microseconds. `ts` is the first key in every Zeek record,
+# so the lookahead only has to cover the value itself.
+TIME_PREFIX = "ts":
+TIME_FORMAT = %s.%6N
+MAX_TIMESTAMP_LOOKAHEAD = 25
+category = Network & Security
+description = Zeek JSON from a Security Onion sensor
+
+[suricata:json]
+SHOULD_LINEMERGE = false
+LINE_BREAKER = ([\r\n]+)
+TRUNCATE = 0
+# EVE ISO-8601 with a microsecond fraction and a NUMERIC offset (+0000, no
+# colon), which is what %z expects. Confirmed against a live record rather than
+# assumed -- the offset spelling varies between Suricata builds and a mismatch
+# shifts every event by hours without erroring.
+TIME_PREFIX = "timestamp":"
+TIME_FORMAT = %Y-%m-%dT%H:%M:%S.%6N%z
+MAX_TIMESTAMP_LOOKAHEAD = 40
+category = Network & Security
+description = Suricata EVE JSON from a Security Onion sensor
+
+# NO TIME_PREFIX / TIME_FORMAT HERE, DELIBERATELY.
+# /nsm/strelka/log/strelka.log was empty every time it was checked, so the
+# record layout has never been seen on this range. Guessing a timestamp format
+# and being wrong is worse than letting Splunk auto-detect: auto-detection
+# failing is visible as events at the wrong time, whereas a confidently wrong
+# TIME_FORMAT looks authoritative. Add them once a real record exists.
+#
+# Strelka is idle because it analyses files Zeek carves from traffic, and no
+# file is ever complete while the mirror drops ~40% of packets. See
+# roles/vyos_mirror/defaults/main.yml.
+[strelka:json]
+SHOULD_LINEMERGE = false
+LINE_BREAKER = ([\r\n]+)
+TRUNCATE = 0
+category = Network & Security
+description = Strelka file-analysis JSON from a Security Onion sensor

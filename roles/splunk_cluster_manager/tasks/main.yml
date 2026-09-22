@@ -1,0 +1,214 @@
+---
+# =========================================================================
+# splunk_cluster_manager
+# =========================================================================
+# Cluster configuration is server.conf STATE, so it is written as state.
+#
+# The first version drove this through `splunk edit cluster-config` and gated
+# on `splunk show cluster-config`. Both were wrong:
+#
+#   * `show cluster-config` is not a valid subcommand on this build (rc=4).
+#     The task had failed_when: false, so it returned empty stdout every run
+#     and the gate `'mode:manager' not in ''` was always true -- it never
+#     gated anything.
+#   * `edit cluster-config` returned success and left an EMPTY [clustering]
+#     stanza, writing pass4SymmKey into [general] instead. The peers' "Could
+#     not contact manager" was literal: there was no manager, and the key was
+#     not where clustering looks for it.
+#
+# ini_file needs no gate, is idempotent, reports change honestly, and survives
+# the base `splunk` role rewriting server.conf because it runs behind it in the
+# same play. Key names and the valid values for `mode` were read from
+# /opt/splunk/etc/system/README/server.conf.spec on the host rather than
+# recalled: mode = [manager|peer|searchhead|disabled], manager_uri (master_uri
+# is deprecated), and replication_factor / search_factor / cluster_label are
+# valid ONLY for mode=manager.
+# =========================================================================
+
+- name: Wait for the Splunk REST API
+  ansible.builtin.uri:
+    url: "https://127.0.0.1:{{ splunk_mgmt_port }}/services/server/info"
+    method: GET
+    user: "{{ splunk_admin }}"
+    password: "{{ splunk_admin_password }}"
+    force_basic_auth: true
+    validate_certs: false
+    status_code: 200
+  register: cm_api
+  retries: 30
+  delay: 10
+  until: cm_api.status == 200
+
+- name: Configure the [clustering] stanza for manager mode
+  community.general.ini_file:
+    path: /opt/splunk/etc/system/local/server.conf
+    section: clustering
+    option: "{{ item.k }}"
+    value: "{{ item.v }}"
+    mode: '0600'
+    no_extra_spaces: true
+  loop:
+    - { k: 'mode',               v: 'manager' }
+    - { k: 'replication_factor', v: '{{ splunk_rf }}' }
+    - { k: 'search_factor',      v: '{{ splunk_sf }}' }
+    - { k: 'cluster_label',      v: '{{ splunk_cluster_label }}' }
+    - { k: 'pass4SymmKey',       v: '{{ splunk_cluster_secret }}' }
+  loop_control:
+    label: "{{ item.k }}"
+  register: cm_clustering
+
+- name: Restart Splunk to apply cluster-manager mode
+  ansible.builtin.command: /opt/splunk/bin/splunk restart
+  when: cm_clustering is changed
+  changed_when: true
+  # DO NOT judge the restart by its exit code. `splunk restart` returns 1 when
+  # Splunk Web is not up within its own wait, even though splunkd started
+  # cleanly -- observed on pp-splunk-idx02 2026-08-22:
+  #
+  #     Starting splunk server daemon (splunkd)...  Done
+  #     Waiting for web server at http://127.0.0.1:8000 to be available........
+  #     WARNING: web interface does not seem to be available!
+  #     rc=1
+  #
+  # Splunk Web is irrelevant on a cluster peer, and the REST wait immediately
+  # below is the real assertion: it polls until splunkd answers, and fails the
+  # play if it never does. Trusting the CLI's rc failed a whole attempt over a
+  # web server nobody uses, and cascaded -- pp-www then could not connect to an
+  # indexer that had actually restarted fine.
+  failed_when: false
+
+- name: Wait for the REST API after the restart
+  ansible.builtin.uri:
+    url: "https://127.0.0.1:{{ splunk_mgmt_port }}/services/server/info"
+    method: GET
+    user: "{{ splunk_admin }}"
+    password: "{{ splunk_admin_password }}"
+    force_basic_auth: true
+    validate_certs: false
+    status_code: 200
+  register: cm_api2
+  retries: 30
+  delay: 10
+  until: cm_api2.status == 200
+
+# Assert Splunk agrees it is a manager, from its own REST view rather than from
+# the file we just wrote. Writing config is transport; the running instance
+# reporting the mode is the outcome.
+# SPLUNK REPORTS THE LEGACY TERM. server.conf takes `mode = manager` -- the
+# spec file on the host documents exactly that -- but /services/cluster/config
+# reports it back as "master". Both are accepted here because the API and the
+# config file genuinely disagree, and matching only "manager" produced an
+# assertion that could never be true against a correctly configured manager.
+- name: Splunk must report itself as the cluster manager
+  ansible.builtin.uri:
+    url: "https://127.0.0.1:{{ splunk_mgmt_port }}/services/cluster/config?output_mode=json"
+    method: GET
+    user: "{{ splunk_admin }}"
+    password: "{{ splunk_admin_password }}"
+    force_basic_auth: true
+    validate_certs: false
+    status_code: 200
+    return_content: true
+  register: cm_mode
+  retries: 10
+  delay: 10
+  until: (cm_mode.json.entry[0].content.mode | default('')) in ['manager', 'master']
+  failed_when: (cm_mode.json.entry[0].content.mode | default('')) not in ['manager', 'master']
+
+- name: Report the manager's own view of itself
+  ansible.builtin.debug:
+    msg: >-
+      mode={{ cm_mode.json.entry[0].content.mode }}
+      label={{ cm_mode.json.entry[0].content.cluster_label }}
+      rf={{ cm_mode.json.entry[0].content.replication_factor }}
+      sf={{ cm_mode.json.entry[0].content.search_factor }}
+
+# --- the indexes app, pushed to peers via the bundle ----------------------
+- name: Create the cluster indexes app
+  ansible.builtin.file:
+    path: "{{ splunk_cm_apps_dir }}/{{ splunk_cm_indexes_app }}/local"
+    state: directory
+    mode: '0755'
+
+- name: Template the range's indexes into the app
+  ansible.builtin.template:
+    src: indexes.conf.j2
+    dest: "{{ splunk_cm_apps_dir }}/{{ splunk_cm_indexes_app }}/local/indexes.conf"
+    mode: '0644'
+  register: cm_indexes
+
+# INDEX-TIME parsing for the Security Onion sourcetypes. Rides the same bundle
+# as indexes.conf because both are peer-side: timestamp recognition and line
+# breaking happen on the indexers as events arrive. The search-time half
+# (KV_MODE, field aliases) is a separate file on the SEARCH HEAD -- see
+# roles/splunk-es/templates/so_sourcetypes_props.conf.j2.
+- name: Template the Security Onion sourcetype parsing into the app
+  ansible.builtin.template:
+    src: props.conf.j2
+    dest: "{{ splunk_cm_apps_dir }}/{{ splunk_cm_indexes_app }}/local/props.conf"
+    mode: '0644'
+  register: cm_props
+
+# Only on change: a bundle push restarts peers when the bundle is not
+# reload-compatible, so pushing every run would bounce the indexing tier on
+# every deploy.
+#
+# BOTH templates gate this. When props.conf was added the condition still read
+# `cm_indexes is changed` alone, which would have written the parsing config and
+# then never shipped it -- the peers would keep the old bundle and every SO
+# event would land unparsed, with the file on disk looking perfectly correct.
+- name: Push the cluster bundle to the peers
+  ansible.builtin.command: >-
+    /opt/splunk/bin/splunk apply cluster-bundle --answer-yes
+    -auth {{ splunk_admin }}:{{ splunk_admin_password }}
+  when: cm_indexes is changed or cm_props is changed
+  register: cm_bundle
+  changed_when: true
+
+# =========================================================================
+# License manager
+# =========================================================================
+# host_vars/pp-splunk-cm.yml has declared this host "cluster manager + license
+# manager + deployment server + monitoring console" since the distributed build
+# was designed. Three of those were implemented; licensing was not, and the gap
+# was invisible because a Splunk node with a license installed IS a license
+# manager by default -- so pp-splunk-cm looked correct while three other nodes
+# were quietly being license managers too.
+#
+# Splunk surfaced it on 2026-08-25 with a 72-hour deadline to disable a peer.
+# See roles/splunk_license_peer for the full cause.
+#
+# These two tasks assert the half of the arrangement that lives here: this node
+# holds the license, and it answers to nobody. The peers assert the other half.
+
+- name: This node must hold the deployment's only license
+  ansible.builtin.find:
+    paths: "{{ splunk_license_stack_dir | default('/opt/splunk/etc/licenses/enterprise') }}"
+    patterns: '*.lic,*.license,*.xml'
+    file_type: file
+  register: cm_licenses
+  failed_when: (cm_licenses.files | length) < 1
+
+# `master_uri`/`manager_uri` absent from [license] is what "license master
+# self" means. Asserting the ABSENCE matters because the failure it prevents is
+# silent: if this node were ever pointed at another license manager, every peer
+# would chain through it and the whole deployment would depend on a host nobody
+# recorded as authoritative.
+- name: The license manager must not answer to another license manager
+  community.general.ini_file:
+    path: /opt/splunk/etc/system/local/server.conf
+    section: license
+    option: "{{ item }}"
+    state: absent
+    mode: '0600'
+  loop:
+    - master_uri
+    - manager_uri
+  register: cm_lic_self
+
+- name: Report cluster manager state
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }}: manager of '{{ splunk_cluster_label }}',
+      RF={{ splunk_rf }} SF={{ splunk_sf }},
+      serving {{ splunk_cluster_indexes | length }} indexes to peers.

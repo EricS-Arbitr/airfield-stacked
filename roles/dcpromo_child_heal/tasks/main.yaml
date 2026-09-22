@@ -1,0 +1,248 @@
+---
+# Self-heal residue from a failed Install-ADDSDomain (child-domain path).
+#
+# Failure signature: an earlier deploy started dcpromo(child), passed
+# pre-flight, registered the child domain's CrossRef in the parent forest's
+# Configuration NC, set the local machine's Primary DNS Suffix + Domain
+# hint to the child domain -- but died before completing (or before AD
+# services could start). The machine is left in "half-joined" state:
+#   PartOfDomain=True, Domain=<child>, but ADWS/NTDS Stopped.
+# Two symptoms cascade from that:
+#   1. Unqualified `simspace` NTLM authentication is rejected (Windows
+#      prefixes the username with the machine's now-broken domain hint).
+#   2. bs-dc01 has an orphan CrossRef under CN=Partitions and orphan
+#      Server/NTDS objects under CN=Sites, blocking a retry of
+#      Install-ADDSDomain.
+#
+# This role runs BEFORE `init` in site.yml, targeting pdc_fops only.
+# It's idempotent: on a clean host it's a no-op (detects state, ends host).
+# On a half-joined host it delegates parent-metadata cleanup to bs-dc01
+# (Administrator/EA), clears the local child-domain hints, reboots, then
+# `init` picks up the recovered host on default credentials.
+#
+# See UPSTREAM_FIXES.md 2026-07-13.
+
+# ORDER MATTERS, AND THE ORIGINAL ORDER COULD NOT WORK.
+#
+# This role used to probe with DEFAULT (unqualified `simspace`) credentials
+# first. Those are precisely the credentials broken in the state it exists to
+# repair, so on a half-joined host the first task went UNREACHABLE -- and
+# because `hosts: pdc_fops` contains exactly one host, the play ended there.
+# `ignore_unreachable: true` does not keep a play alive when its only host is
+# unreachable. The three credential fallbacks below were therefore unreachable
+# code on every real failure. Observed 2026-08-10: three deploy attempts, each
+# running exactly one task of this role before init timed out for 30 minutes.
+#
+# MACHINE\simspace is the right first probe because it works in BOTH states
+# this role acts on:
+#   CLEAN (WORKGROUP)  -> resolves to the local SAM
+#   HALF_JOINED        -> resolves to the local SAM, bypassing the broken
+#                         domain hint that rejects unqualified auth
+# It fails only on a genuinely promoted DC, where there is no local SAM left --
+# and that is the one state where we want to no-op anyway.
+- name: Reach candidate child-DC via local MACHINE\simspace auth
+  vars:
+    ansible_user: "{{ heal_local_user }}"
+    ansible_password: "{{ heal_local_password }}"
+  ansible.windows.win_ping:
+  register: heal_local_ping
+  ignore_errors: true
+  ignore_unreachable: true
+
+# dcpromo's "local admin guest customization" resets local Administrator to
+# domain_admin_password, so after any dcpromo attempt this path works even if
+# the simspace account was disturbed.
+- name: Fallback — reach via local MACHINE\Administrator auth
+  vars:
+    ansible_user: "{{ inventory_hostname | upper }}\\Administrator"
+    ansible_password: "{{ domain_admin_password }}"
+  ansible.windows.win_ping:
+  register: heal_admin_ping
+  ignore_errors: true
+  ignore_unreachable: true
+  # `is not succeeded` is WRONG for this and cost a deploy on 2026-08-10: an
+  # unreachable-but-ignored result has failed=false, so `is succeeded` PASSES
+  # and this fallback was skipped. The succeeded/failed tests say nothing about
+  # reachability. Test both explicitly.
+  when: >-
+    (heal_local_ping.unreachable | default(false))
+    or (heal_local_ping.failed | default(false))
+
+# Last resort: default unqualified creds. Succeeds on an ALREADY-PROMOTED DC
+# (local SAM gone, domain account answers) and on a clean host. Kept LAST
+# precisely because it is the one probe that cannot work in the half-joined
+# state.
+- name: Fallback — reach via default unqualified creds
+  ansible.windows.win_ping:
+  register: heal_default_ping
+  ignore_errors: true
+  ignore_unreachable: true
+  when:
+    - (heal_local_ping.unreachable | default(false)) or (heal_local_ping.failed | default(false))
+    - heal_admin_ping.skipped | default(false)
+      or (heal_admin_ping.unreachable | default(false))
+      or (heal_admin_ping.failed | default(false))
+
+# 2026-08-10: fops-dc01 reached a state the original three probes cannot
+# reach -- promoted far enough to LOSE the local SAM (MACHINE\simspace
+# rejected) and serve LDAP on 389, but with ADWS down and NO CrossRef in the
+# parent forest. Local credentials are gone; the only accounts that exist are
+# in the child domain's own directory.
+- name: Fallback — reach via CHILD-domain Administrator
+  vars:
+    ansible_user: "{{ (domain_name | regex_replace('\\..*$','')) | upper }}\\Administrator"
+    ansible_password: "{{ domain_admin_password }}"
+  ansible.windows.win_ping:
+  register: heal_child_ping
+  ignore_errors: true
+  ignore_unreachable: true
+  when:
+    - (heal_local_ping.unreachable | default(false)) or (heal_local_ping.failed | default(false))
+    - heal_admin_ping.skipped | default(false)
+      or (heal_admin_ping.unreachable | default(false))
+      or (heal_admin_ping.failed | default(false))
+    - heal_default_ping.skipped | default(false)
+      or (heal_default_ping.unreachable | default(false))
+      or (heal_default_ping.failed | default(false))
+
+- name: Pick which credential succeeded
+  vars:
+    ok_local:   "{{ not (heal_local_ping.unreachable   | default(true)) and not (heal_local_ping.failed   | default(true)) }}"
+    ok_admin:   "{{ not (heal_admin_ping.unreachable   | default(true)) and not (heal_admin_ping.failed   | default(true)) }}"
+    ok_default: "{{ not (heal_default_ping.unreachable | default(true)) and not (heal_default_ping.failed | default(true)) }}"
+    ok_child:   "{{ not (heal_child_ping.unreachable   | default(true)) and not (heal_child_ping.failed   | default(true)) }}"
+  ansible.builtin.set_fact:
+    heal_auth_user: >-
+      {{ heal_local_user if ok_local | bool
+         else ((inventory_hostname | upper ~ '\\Administrator') if ok_admin | bool
+         else (ansible_user if ok_default | bool
+         else ((domain_name | regex_replace('\\..*$','')) | upper ~ '\\Administrator'))) }}
+    heal_auth_password: >-
+      {{ heal_local_password if ok_local | bool
+         else (domain_admin_password if ok_admin | bool
+         else (ansible_password if ok_default | bool
+         else domain_admin_password)) }}
+    heal_reachable: "{{ (ok_local | bool) or (ok_admin | bool) or (ok_default | bool) or (ok_child | bool) }}"
+
+- name: End host — unreachable via any credential (platform issue)
+  ansible.builtin.meta: end_host
+  when: not (heal_reachable | bool)
+
+- name: Detect half-join state
+  vars:
+    ansible_user: "{{ heal_auth_user }}"
+    ansible_password: "{{ heal_auth_password }}"
+  ansible.windows.win_shell: |
+    $cs   = Get-WmiObject Win32_ComputerSystem
+    $adws = Get-Service ADWS -ErrorAction SilentlyContinue
+    $ntds = Get-Service NTDS -ErrorAction SilentlyContinue
+    $inChild   = $cs.PartOfDomain -and $cs.Domain -eq '{{ domain_name }}'
+    $adServicesUp = $adws -and $adws.Status -eq 'Running' -and $ntds -and $ntds.Status -eq 'Running'
+    if      ($inChild -and -not $adServicesUp) { 'HALF_JOINED' }
+    elseif  ($inChild -and     $adServicesUp) { 'ALREADY_DC' }
+    else                                       { 'CLEAN' }
+  register: heal_state
+  changed_when: false
+
+- name: Announce detected state
+  ansible.builtin.debug:
+    msg: "dcpromo_child_heal: {{ inventory_hostname }} state = {{ heal_state.stdout | trim }}"
+
+- name: End host — nothing to heal (state is CLEAN or ALREADY_DC)
+  ansible.builtin.meta: end_host
+  when: heal_state.stdout | trim != 'HALF_JOINED'
+
+# ------------------------------------------------------------------
+# HALF-JOINED -> heal
+# ------------------------------------------------------------------
+- name: Compute expected child NetBIOS label (upper) for metadata paths
+  ansible.builtin.set_fact:
+    heal_child_label_upper: "{{ (domain_name | regex_replace('\\..*$','')) | upper }}"
+    heal_child_dc_upper: "{{ inventory_hostname | upper }}"
+
+- name: Clean parent-forest metadata (delegate to pdc_blackstone as Administrator/EA)
+  delegate_to: "{{ groups['pdc_blackstone'] | first }}"
+  vars:
+    ansible_user: "{{ heal_parent_admin_user }}"
+    ansible_password: "{{ heal_parent_admin_password }}"
+  ansible.windows.win_shell: |
+    $cfg = (Get-ADRootDSE).ConfigurationNamingContext
+    "=== forest domains BEFORE ==="
+    (Get-ADForest).Domains
+    foreach ($dn in @(
+      "CN=NTDS Settings,CN={{ heal_child_dc_upper }},CN=Servers,CN=Default-First-Site-Name,CN=Sites,$cfg",
+      "CN={{ heal_child_dc_upper }},CN=Servers,CN=Default-First-Site-Name,CN=Sites,$cfg",
+      "CN={{ heal_child_label_upper }},CN=Partitions,$cfg"
+    )) {
+      try { Remove-ADObject -Identity $dn -Recursive -Confirm:$false -ErrorAction Stop; "REMOVED: $dn" }
+      catch { "SKIP: $dn -- $($_.Exception.Message)" }
+    }
+    "=== forest domains AFTER ==="
+    (Get-ADForest).Domains
+  register: heal_parent_cleanup
+  ignore_errors: true
+
+- name: Show parent-forest cleanup output
+  ansible.builtin.debug:
+    var: heal_parent_cleanup.stdout_lines
+
+- name: Clear local child-domain hints on the half-joined host
+  # Install-ADDSDomain writes Primary DNS Suffix + Domain/NV Domain
+  # to the Tcpip\Parameters key BEFORE the reboot that finalizes
+  # promotion. If promotion never finishes, those hints persist and
+  # cause every unqualified NTLM auth to prefix the wrong domain.
+  # Clearing them + rebooting restores the local SAM as the auth path.
+  vars:
+    ansible_user: "{{ heal_auth_user }}"
+    ansible_password: "{{ heal_auth_password }}"
+  ansible.windows.win_shell: |
+    $tcpKey = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters'
+    Set-ItemProperty -Path $tcpKey -Name 'Domain'    -Value '' -Force -ErrorAction SilentlyContinue
+    Set-ItemProperty -Path $tcpKey -Name 'NV Domain' -Value '' -Force -ErrorAction SilentlyContinue
+    Remove-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters' `
+                        -Name 'DcPromoInProgress' -Force -ErrorAction SilentlyContinue
+    # Verify what we wrote so the log shows an audit trail:
+    $tcp = Get-ItemProperty -Path $tcpKey
+    "Post-heal Domain='$($tcp.Domain)' NV Domain='$($tcp.'NV Domain')'"
+  register: heal_local_registry
+
+- name: Show local registry reset output
+  ansible.builtin.debug:
+    var: heal_local_registry.stdout_lines
+
+# Fire the reboot with the auth we used to reach the host, using
+# shutdown.exe /r /t 5 /f. Reason: earlier Start-Job + Restart-Computer
+# attempt got killed with the WinRM PowerShell process when the session
+# closed (Start-Job children die with the parent shell), so the reboot
+# never actually happened -- registry values were set, but not applied.
+# shutdown.exe launches a detached system process scheduled 5s out,
+# fully decoupled from WinRM. Once WinRM drops, machine reboots on schedule.
+- name: Fire reboot (detached shutdown.exe, no wait)
+  vars:
+    ansible_user: "{{ heal_auth_user }}"
+    ansible_password: "{{ heal_auth_password }}"
+  ansible.windows.win_shell: |
+    & shutdown.exe /r /t 5 /f /c "dcpromo_child_heal: clearing half-join state"
+    'REBOOT_QUEUED'
+  register: heal_reboot_fired
+  changed_when: "'REBOOT_QUEUED' in heal_reboot_fired.stdout"
+
+# Wait for the host to come back using DEFAULT (unqualified simspace)
+# credentials. Post-heal the domain hint is empty -- so unqualified
+# `simspace` NTLM resolves to the local SAM correctly, which is exactly
+# what init needs to succeed. No `vars:` override here means this task
+# uses group_vars/windows.yml defaults (ansible_user: simspace).
+- name: Wait for reboot to complete on DEFAULT (unqualified) creds
+  ansible.builtin.wait_for_connection:
+    delay: 60
+    sleep: 15
+    timeout: 900
+
+- name: Verify default win_ping succeeds post-heal
+  ansible.windows.win_ping:
+  register: heal_post_ping
+
+- name: HEALED
+  ansible.builtin.debug:
+    msg: "dcpromo_child_heal: {{ inventory_hostname }} restored to WORKGROUP; default creds now succeed. Deploy will proceed via init -> dcpromo(child)."
+  when: heal_post_ping is success

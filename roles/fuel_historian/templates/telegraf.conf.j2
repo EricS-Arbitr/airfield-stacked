@@ -1,0 +1,89 @@
+# Ansible managed. Polls ff-plc-1's SCADA-bus Modbus TCP server per §4
+# register map; writes into InfluxDB 2.7 bucket `fuel`.
+#
+# Modbus address translation (matches fuel_hmi/FUXA):
+#  * Coils / Holding Registers are OpenPLC's OWN ST-program variables
+#    (%QX0.0-%QX1.1 = coil 0-9, %QW0-%QW7 = HR 0-7). Fuelsim's own
+#    values for these live on fuelsim:502 but OpenPLC as master doesn't
+#    mirror them (do_size = aow_size = aor_size = 0), by design --
+#    fuelsim's state_machine is authoritative and we don't want OpenPLC
+#    clobbering it. So Telegraf reads what our .st sets (mostly zeros).
+#  * Discrete Inputs are OpenPLC-slave-mapped from fuelsim: fuelsim's
+#    DI n lands at OpenPLC %IX(100+n/8).(n%8) = Modbus DI (800 + n).
+#  * Input Registers similarly: fuelsim's IR n lands at %IW(100+n) =
+#    Modbus IR (100 + n).
+#
+# Telegraf's Modbus input plugin uses 0-based addresses and expects ONE
+# array per register category (multiple `coils = [...]` blocks are
+# INVALID TOML -- only the last one wins). Old template had that bug;
+# fixed here by building each category's array via a single Jinja
+# join.
+
+[agent]
+  interval = "1s"
+  round_interval = true
+  flush_interval = "5s"
+  hostname = "fuel-hist"
+  omit_hostname = false
+
+# InfluxDB's container publishes port 8086 to the prod NIC only
+# (fuel_hist_ip = 172.16.46.18), not to 0.0.0.0 or localhost. Telegraf
+# runs on the host (not in a container) so localhost:8086 refuses --
+# nothing's listening there. Use the prod-NIC IP directly. Traffic
+# still stays on the host (loopback via docker's NAT).
+[[outputs.influxdb_v2]]
+  urls   = ["http://{{ fuel_hist_ip }}:8086"]
+  token  = "{{ influxdb_admin_token }}"
+  organization = "{{ influxdb_org }}"
+  bucket = "{{ influxdb_bucket_fuel }}"
+
+[[inputs.modbus]]
+  name              = "fuel"
+  slave_id          = 1
+  timeout           = "2s"
+  controller        = "tcp://{{ fuel_plc_ip }}:{{ fuel_modbus_port }}"
+
+  # --- Coils (FC1) -- OpenPLC's own %QX outputs, addresses 0-9 ---
+  coils = [
+{% for c in fuel_modbus_coils %}
+    { name = "{{ c.tag }}", address = [{{ c.addr }}] }{% if not loop.last %},{% endif %}
+
+{% endfor %}
+  ]
+
+  # --- Discrete inputs (FC2) -- slave-mapped from fuelsim, addr + 800 ---
+  discrete_inputs = [
+{% for d in fuel_modbus_discrete_inputs %}
+    { name = "{{ d.tag }}", address = [{{ d.addr + 800 }}] }{% if not loop.last %},{% endif %}
+
+{% endfor %}
+  ]
+
+  # --- Input registers (FC4) -- slave-mapped from fuelsim ---
+  #   IR + 100 : ai_size=10 mirror of fuelsim's INPUT registers (IR 0-9)
+  #   IR + 111 : aor_size=8 mirror of fuelsim's HOLDING registers (HR 0-7)
+  # Both land in OpenPLC's Modbus IR area (not HR). The single-word gap
+  # at IR 110 is a padding quirk of OpenPLC's slave-device memory map.
+  # Verified empirically 2026-07-20 via pymodbus sweep. So HRs get
+  # bundled INTO input_registers, not the FC3 section.
+  input_registers = [
+{% for r in fuel_modbus_input_registers %}
+    { name = "{{ r.tag }}", byte_order = "AB", data_type = "INT16", scale = {{ r.scale }}, address = [{{ r.addr + 100 }}] }{% if not loop.last or fuel_modbus_holding_registers %},{% endif %}
+
+{% endfor %}
+{% for h in fuel_modbus_holding_registers %}
+    { name = "{{ h.tag }}", byte_order = "AB", data_type = "INT16", scale = 1.0, address = [{{ h.addr + 111 }}] }{% if not loop.last %},{% endif %}
+
+{% endfor %}
+  ]
+
+  # --- Holding registers (FC3) -- OpenPLC's own %QW0-7 outputs (unset) ---
+  # Empty by design. fuelsim's real HR values are polled via IR above
+  # (OpenPLC's slave-device aor lands them there). Keeping the section
+  # commented so future edits are unambiguous.
+  # holding_registers = []
+
+  # Totalizers (LR*_METER_LO + LR*_METER_HI): fuelsim exposes as
+  # 32-bit split hi-first. To reassemble into gallons, add a Flux
+  # transform in Grafana (map + math) rather than another Modbus read.
+  # See build sheet §4 note on 32-bit split.

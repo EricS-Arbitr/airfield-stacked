@@ -1,0 +1,50 @@
+### Managed by Ansible — roles/splunk-es. Do not edit on the host.
+#
+# SEARCH-TIME parsing and CIM aliases for the Security Onion sourcetypes.
+#
+# WHY HERE AND NOT IN THE CLUSTER BUNDLE. KV_MODE and FIELDALIAS are
+# search-time: they are read per search from the knowledge bundle the search
+# head replicates to the peers, and they apply retroactively to data already
+# indexed. Index-time settings -- TIME_FORMAT, LINE_BREAKER, TRUNCATE -- are
+# the opposite and live in roles/splunk_cluster_manager/templates/props.conf.j2,
+# pushed to the peers via `apply cluster-bundle`. Mixing the two up produces
+# config that looks right and does nothing.
+#
+# NO ADD-ON EXISTS FOR THIS DATA, so these nine lines replace one.
+# /var/share/installers/splunk/ does not exist on this range and pp-splunk
+# carries no Zeek or Suricata TA (measured: its app list has
+# Splunk_TA_microsoft_sysmon, Splunk_TA_squid and Splunk_TA_windows and
+# nothing else relevant). With zero egress we cannot fetch one, so the parsing
+# is ours.
+#
+# That is cheaper than it sounds because BOTH SOURCES ARE ALREADY JSON.
+# KV_MODE = json extracts every field whole, with no regex to maintain and
+# nothing to break when a new Zeek log type appears. The aliases below exist
+# only to map JSON names onto the CIM names ES and the hunt dashboards expect.
+
+[zeek:json]
+KV_MODE = json
+# Zeek's connection 4-tuple uses dotted keys, which need quoting on the left of
+# an alias. Mapping them to CIM src/dest lets Network_Traffic searches and the
+# hunt workstations use one vocabulary across Zeek, Suricata and Sysmon.
+FIELDALIAS-zeek_src       = "id.orig_h" AS src
+FIELDALIAS-zeek_dest      = "id.resp_h" AS dest
+FIELDALIAS-zeek_src_port  = "id.orig_p" AS src_port
+FIELDALIAS-zeek_dest_port = "id.resp_p" AS dest_port
+FIELDALIAS-zeek_transport = proto AS transport
+
+[suricata:json]
+KV_MODE = json
+# EVE already names ports src_port/dest_port, so only the addresses and the
+# protocol need aliasing.
+FIELDALIAS-suri_src       = src_ip AS src
+FIELDALIAS-suri_dest      = dest_ip AS dest
+FIELDALIAS-suri_transport = proto AS transport
+
+# Aliases are deliberately omitted: the record layout has never been observed
+# on this range because the log is empty. KV_MODE alone is safe -- it extracts
+# whatever fields turn out to be there -- whereas an alias naming a field that
+# does not exist is silent and misleading. Add CIM mappings once a real record
+# has been read.
+[strelka:json]
+KV_MODE = json

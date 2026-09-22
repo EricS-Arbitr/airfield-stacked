@@ -1,0 +1,139 @@
+- name: Ensure Temp Directory Exists
+  ansible.windows.win_file:
+    path: "C:\\temp"
+    state: directory
+
+- name: Download Splunk Forwarder using win_get_url with proxy settings
+  ansible.windows.win_get_url:
+    url: "{{ splunk_forwarder_installer }}"
+    dest: "C:\\temp\\splunkfwd.msi"
+    method: GET
+    follow_redirects: all
+    use_proxy: yes
+    proxy_url: "http://{{ inet_proxy_addr }}:{{ inet_proxy_port }}"
+    proxy_use_default_credential: yes
+    timeout: 300
+    validate_certs: no
+    headers:
+      User-Agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/113.0.0.0 Safari/537.36"
+
+- name: "Install Splunk forwarder for Windows silently"
+  ansible.windows.win_package:
+    path: "c:\\temp\\splunkfwd.msi"
+    arguments: >-
+      AGREETOLICENSE=Yes
+      SERVICESTARTTYPE=auto
+      LAUNCHSPLUNK=1
+      USE_LOCAL_SYSTEM=1
+      SPLUNKUSERNAME="{{ splunk_user }}"
+      SPLUNKPASSWORD="{{ splunk_password }}"
+  when: ansible_distribution_version is version("6.1.7601", ">=")
+  vars:
+    ansible_become_method: runas
+  register: splunk_install_result
+
+- name: "copy templated inputs.conf"
+  ansible.builtin.template:
+    src: /etc/ansible/roles/splunk-forwarder/templates/inputs.conf.j2
+    dest: "{{ splunk_forwarder_win_dir }}/etc/system/local/inputs.conf"
+  register: inputs_conf_stat
+
+- name: "copy templated outputs.conf"
+  ansible.builtin.template:
+    src: /etc/ansible/roles/splunk-forwarder/templates/outputs.conf.j2
+    dest: "{{ splunk_forwarder_win_dir }}/etc/system/local/outputs.conf"
+  register: outputs_conf_stat
+
+- name: "copy templated limits.conf"
+  ansible.builtin.template:
+    src: /etc/ansible/roles/splunk-forwarder/templates/limits.conf.j2
+    dest: "{{ splunk_forwarder_win_dir }}/etc/system/local/limits.conf"
+  register: limits_conf_stat
+
+# RESTART ON OUTCOME, NOT ON CHANGE.
+#
+# This was restart-when-a-template-changed, and that cannot recover from the
+# state it just produced. On 2026-08-19 the templates were rewritten with the
+# new indexer list, the restart then failed on every Windows host, and the next
+# run found the templates already correct -- so `changed` was false, the
+# restart was skipped, and the play reported changed=0 failed=0 while every
+# forwarder still pointed at an address that no longer receives.
+#
+# A change-triggered action is only safe if it always succeeds. This one asks
+# whether the forwarder is actually connected to an indexer and fixes it if
+# not, which self-heals from a failed restart, a config drift, or a UF that
+# died quietly.
+- name: Is the forwarder actually connected to an indexer?
+  ansible.windows.win_powershell:
+    script: |
+      $Ansible.Changed = $false
+      $idx = @({% for ip in splunk_indexers %}'{{ ip }}'{% if not loop.last %},{% endif %}{% endfor %})
+      $n = @(Get-NetTCPConnection -State Established -RemotePort {{ splunk_forwarder_port }} -ErrorAction SilentlyContinue |
+             Where-Object { $idx -contains $_.RemoteAddress }).Count
+      Write-Output ([string]$n)
+  register: uf_conn
+  changed_when: false
+
+# NOT win_service. `state: restarted` fails on every Windows host with
+# "Cannot stop SplunkForwarder service on computer '.'" -- the .NET
+# ServiceController cannot stop this service cleanly. Splunk's own binary
+# manages its lifecycle correctly.
+#
+# CANNOT HANG. The Linux twin of this task blocked an unattended deploy
+# overnight, twice, because `splunk restart` on an installation whose licence
+# had not been accepted prints "Do you agree with this license? [y/n]:" and
+# waits on stdin. The MSI here accepts the licence at install time
+# (AGREETOLICENSE=Yes) and this task is skipped on a fresh install anyway, so
+# that exact path does not apply -- but "cannot hang" must not rest on my
+# having predicted every prompt. Flags so it cannot ask, and a hard wait so it
+# cannot block even if it does.
+- name: Restart the forwarder
+  ansible.windows.win_shell: |
+    $exe = '{{ splunk_forwarder_win_dir }}\bin\splunk.exe'
+    $p = Start-Process -FilePath $exe `
+           -ArgumentList 'restart','--accept-license','--answer-yes','--no-prompt' `
+           -NoNewWindow -PassThru
+    if (-not $p.WaitForExit(300000)) {
+      $p.Kill()
+      Write-Output 'RESTART_TIMEOUT'
+    } else {
+      Write-Output ("RESTART_EXIT_" + $p.ExitCode)
+    }
+  register: uf_restart
+  changed_when: true
+  failed_when: "'RESTART_TIMEOUT' in (uf_restart.stdout | default(''))"
+  when:
+    - splunk_install_result is not changed
+    - (uf_conn.output[0] | default('0') | int) == 0
+      or inputs_conf_stat.changed or outputs_conf_stat.changed or limits_conf_stat.changed
+
+# Assert the OUTCOME. `splunk restart` exiting 0 is not the same as a forwarder
+# delivering data, and a UF that is up but connected to nothing is exactly the
+# state this whole task exists to prevent.
+- name: The forwarder must end up connected to an indexer
+  ansible.windows.win_powershell:
+    script: |
+      $Ansible.Changed = $false
+      $idx = @({% for ip in splunk_indexers %}'{{ ip }}'{% if not loop.last %},{% endif %}{% endfor %})
+      $n = @(Get-NetTCPConnection -State Established -RemotePort {{ splunk_forwarder_port }} -ErrorAction SilentlyContinue |
+             Where-Object { $idx -contains $_.RemoteAddress }).Count
+      Write-Output ([string]$n)
+  register: uf_conn_after
+  changed_when: false
+  until: (uf_conn_after.output[0] | default('0') | int) > 0
+  retries: 12
+  delay: 10
+  when: splunk_install_result is not changed
+
+- name: "Define the splunk services"
+  set_fact:
+    splunk_service: "SplunkForwarder"
+
+# An explicit ceiling: win_reboot defaults to 600, and 600 is not a cold
+# Windows boot on freshly provisioned hardware -- airfield-range lost two
+# members outright to that default on 2026-09-22. Matching the 1800 used
+# everywhere else. A ceiling, not a delay.
+- name: "Reboot after install when needed"
+  ansible.windows.win_reboot:
+    reboot_timeout: 1800
+  when: splunk_install_result is changed

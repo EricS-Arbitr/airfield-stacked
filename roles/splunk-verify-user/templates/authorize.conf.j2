@@ -1,0 +1,49 @@
+### Managed by Ansible — roles/splunk-verify-user. Do not edit on the host.
+#
+# Least-privilege role for verify_deployment.sh. Inherits `user` (search, plus
+# read on globally-shared knowledge objects such as the CIM data models), adds
+# only the REST reads needed to assert which add-ons are installed, and grants
+# no write, no delete, no admin.
+#
+# srchIndexesAllowed = * is deliberate: the verifier has to see every index the
+# range writes to, or a missing index reads as a passing check.
+#
+# 2026-08-18. This role was blamed for four rounds for a problem it never had.
+#
+# svc_verify appeared to see ~85 of 454,659 Sysmon events, and index
+# permissions, srchFilter and srchTimeWin were each hypothesised, shipped and
+# then ruled out by measurement. The actual cause was outside authorize.conf
+# entirely: every svc_verify reading came from `splunk search` on the CLI and
+# every admin reading from Splunk Web. Running the identical search as ADMIN on
+# the CLI also returned 85. Same interface, two accounts, identical result --
+# the grant was correct throughout.
+#
+# The values below are therefore explicit declarations, not fixes. They are
+# kept because an authorization grant should state what it allows rather than
+# inherit it silently, but none of them changed the numbers:
+#
+#   search = enabled   granted explicitly rather than assumed from `user`.
+#   srchTimeWin = -1   unlimited. `user` already supplies -1; an earlier
+#                      version set 0 here, which is MORE restrictive than the
+#                      value it overrode.
+#   srchIndexes*  = *  the verifier must see every index the range writes to,
+#                      or a missing index reads as a passing check.
+#   srchDiskQuota      headroom for multi-hundred-thousand-event scans.
+#
+# verify_data.sh now runs its searches over REST for this reason. If this role
+# is ever suspected again, run the controlled comparison FIRST: the same search
+# as two accounts through one interface, then one account through two
+# interfaces.
+
+[role_{{ splunk_verify_role }}]
+importRoles = user
+search = enabled
+srchIndexesAllowed = *
+srchIndexesDefault = *
+srchTimeWin = -1
+srchJobsQuota = 5
+rtSrchJobsQuota = 0
+srchDiskQuota = 500
+{% for cap in splunk_verify_capabilities %}
+{{ cap }} = enabled
+{% endfor %}

@@ -1,0 +1,124 @@
+---
+# fuel_farm_playbook.yml -- deploy the fuel farm OT subsystem per
+# systems/fuel_farm/fuel-farm-build-sheet.md.
+#
+# Runs standalone for now (per user direction on 2026-07-08). Merge into
+# site.yml later once the OT tier is generally ready to bolt onto the
+# core airfield deploy. Assumes the following are already in place:
+#   - site.yml has been run at least through pfSense + bs-modbus-gateway
+#     so that the L3.5 boundary (bs-ops-fw) and the OT gateway have their
+#     interfaces up. Otherwise Ansible can't reach these hosts over mgmt
+#     (mgmt IPs live in 10.255.240.0/20 and are always reachable via the
+#     platform mgmt fabric; production /29 and /24 subnets require
+#     bs-modbus-gateway to be configured).
+#   - group_vars/fuel.yml holds the register map, seed data, and
+#     endpoint IPs.  host_vars/{ff-plc-1,fuel-farm-sim,fuel-hist,
+#     fuel-db,control-room-hmi}.yml carry the dual-home network config.
+#
+# Deploy order (build sheet §9): fuel_db -> fuel_sim -> fuel_plc ->
+# fuel_historian -> fuel_hmi. Rationale: DB schema before anything
+# writes to it; field slave up before PLC starts polling; PLC's Modbus
+# server up before Telegraf/FUXA connect.
+#
+# Idempotent: every role is safe to re-run. To wipe + reprovision the
+# audit data between exercise iterations, use --tags reset (roles honor
+# an optional `reset: true` extra-var; see per-role tasks/main.yml).
+
+# OT hosts have no direct outbound path (L3.5 boundary + bs-modbus-gateway
+# don't route DNS or HTTPS out from 172.16.45/46). The mgmt-plane platform
+# gateway 10.255.240.1 runs a caching HTTP proxy on :3128 that DOES work
+# from these hosts via their mgmt NIC. Configure apt/docker/env to route
+# through it so the downstream fuel roles' package installs succeed.
+# Confirmed 2026-07-16. See UPSTREAM_FIXES.md 2026-07-16.
+- name: platform_proxy — route apt/docker/env through mgmt-plane proxy
+  hosts: fuel
+  gather_facts: false
+  become: true
+  roles:
+    - platform_proxy
+  tags:
+    - platform_proxy
+    - fuel
+
+- name: Common role — fuel enclave (dual-home netplan, hardening, UF)
+  hosts: fuel
+  gather_facts: true
+  become: true
+  roles:
+    - common
+  tags:
+    - common
+    - fuel
+
+- name: fuel_db — PostgreSQL 16 + TimescaleDB + audit schema + seeds
+  # gather_facts: true so the role can key its apt-repo URLs to
+  # `ansible_distribution_release` (jammy vs noble). SimSpace images
+  # are actually jammy despite CLAUDE.md declaring noble baseline;
+  # PGDG + TimescaleDB packagecloud both support both, keyed by
+  # release codename.
+  hosts: fuel-db
+  gather_facts: true
+  become: true
+  # get_url uses Python urllib which reads HTTP_PROXY from its task
+  # environment. Since we no longer set /etc/environment shell env vars
+  # (curl 7.81's NO_PROXY handling made that break intra-range HTTP),
+  # scope the proxy to just this play so PGDG + TimescaleDB GPG key
+  # downloads can reach out via the mgmt-plane proxy.
+  environment:
+    HTTP_PROXY: "http://10.255.240.1:3128"
+    HTTPS_PROXY: "http://10.255.240.1:3128"
+    http_proxy: "http://10.255.240.1:3128"
+    https_proxy: "http://10.255.240.1:3128"
+  roles:
+    - fuel_db
+  tags:
+    - fuel_db
+    - fuel
+
+- name: fuel_sim — pymodbus field slave + physics + 48h replay harness
+  hosts: fuel-farm-sim
+  gather_facts: false
+  become: true
+  roles:
+    - fuel_sim
+  tags:
+    - fuel_sim
+    - fuel
+
+- name: fuel_plc — OpenPLC v4 runtime + SCADA-bus Modbus server on 502
+  hosts: ff-plc-1
+  gather_facts: false
+  become: true
+  roles:
+    - fuel_plc
+  tags:
+    - fuel_plc
+    - fuel
+
+- name: fuel_historian — Telegraf + InfluxDB 2.7 + Grafana
+  hosts: fuel-hist
+  gather_facts: false
+  become: true
+  # Same reason as fuel_db play: get_url downloads (InfluxData apt key)
+  # need the proxy in task environment because we no longer set shell
+  # env vars in /etc/environment. Scoped to this play only.
+  environment:
+    HTTP_PROXY: "http://10.255.240.1:3128"
+    HTTPS_PROXY: "http://10.255.240.1:3128"
+    http_proxy: "http://10.255.240.1:3128"
+    https_proxy: "http://10.255.240.1:3128"
+  roles:
+    - fuel_historian
+  tags:
+    - fuel_historian
+    - fuel
+
+- name: fuel_hmi — FUXA on the shared control-room-hmi
+  hosts: control-room-hmi
+  gather_facts: false
+  become: true
+  roles:
+    - fuel_hmi
+  tags:
+    - fuel_hmi
+    - fuel

@@ -1,0 +1,60 @@
+################################################################
+# /etc/rsyslog.d/30-remote.conf — central syslog collector
+# Managed by Ansible (syslog_server role). Do not edit by hand.
+################################################################
+
+# Receive on UDP 514
+module(load="imudp")
+input(type="imudp" port="514")
+
+# Receive on TCP 514
+module(load="imtcp")
+input(type="imtcp" port="514")
+
+# Per-host file template for sources whose syslog messages DO include
+# a HOSTNAME field (VyOS routers, Linux hosts). The log shipper on this
+# same host uses the directory name as the host= field.
+template(
+  name="RemoteHostFile"
+  type="list"
+) {
+  constant(value="/var/log/remote/")
+  property(name="hostname" securepath="replace")
+  constant(value="/syslog.log")
+}
+
+{% for entry in syslog_source_ip_map | default([]) %}
+# {{ entry.name }} — pfSense source IP. Its syslogd forwards remote messages
+# without a HOSTNAME field (malformed RFC3164, see UPSTREAM_FIXES.md
+# 2026-06-30), so we route by $fromhost-ip to a hardcoded per-host file
+# path. Adding more pfSense firewalls = add an entry to host_vars/soc-syslog
+# under syslog_source_ip_map.
+if $fromhost-ip == '{{ entry.ip }}' then {
+    action(
+      type="omfile"
+      file="/var/log/remote/{{ entry.name }}/syslog.log"
+      createDirs="on"
+      fileCreateMode="0640"
+      dirCreateMode="0755"
+      fileOwner="syslog"
+      fileGroup="adm"
+    )
+    stop
+}
+{% endfor %}
+
+# Default path: every other remote source (VyOS, Linux, future Windows
+# forwarders) uses $hostname parsed from the message. Localhost-originated
+# messages are NOT matched here and keep their normal /var/log/syslog path.
+if $fromhost-ip != '127.0.0.1' then {
+    action(
+      type="omfile"
+      dynaFile="RemoteHostFile"
+      createDirs="on"
+      fileCreateMode="0640"
+      dirCreateMode="0755"
+      fileOwner="syslog"
+      fileGroup="adm"
+    )
+    stop
+}

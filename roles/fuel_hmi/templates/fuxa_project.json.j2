@@ -1,0 +1,215 @@
+{#
+  fuxa_project.json.j2 -- FUXA v1.13 project file for the fuel farm HMI.
+
+  Schema learned from frangoteam/FUXA client/dist/assets/project.demo.fuxap
+  (fetched 2026-07-17) and from server/runtime/devices/modbus/index.js:
+
+  Top-level keys: {version, projectFile, server, devices, hmi, charts}.
+  Devices are keyed by UUID, not name. Each tag has:
+    - address: 1-based Modbus register (FUXA subtracts 1 internally)
+    - memaddress: NUMERIC constant
+        0      = Coils
+        100000 = Discrete Inputs
+        300000 = Input Registers
+        400000 = Holding Registers
+    - type: data type string ("Bool", "Int16", ...)
+    - divisor: read-side scale (raw / divisor = engineering units)
+
+  Widgets in items{} reference tags via variableId of form
+  "DeviceName^~^TagName".
+
+  The two SVG documents are authored as separate files under files/
+  and inlined by Jinja's lookup filter (with |tojson escaping) into
+  the view's svgcontent string.
+#}
+{
+  "version": "1.00",
+  "projectFile": "fuel_farm.fuxap",
+  "server": {
+    "id": "0",
+    "name": "FuxaServer",
+    "type": "FuxaServer",
+    "property": { "address": "0.0.0.0" }
+  },
+  "devices": {
+    "{{ fuxa_plc_device_uuid }}": {
+      "id": "{{ fuxa_plc_device_uuid }}",
+      "name": "PLC-FuelFarm",
+      "type": "ModbusTCP",
+      "enabled": true,
+      "polling": 1000,
+      "property": {
+        "address": "{{ fuel_plc_ip }}",
+        "port": {{ fuel_modbus_port }},
+        "slaveid": 1
+      },
+      "tags": {
+{% set tag_rows = [] %}
+{# FUXA driver bug workaround: for coils, memaddress must be the STRING
+   "000000" (six zeros), not the numeric 0. The main tag loop keys memory
+   with formatAddress(memaddress, token) = `${token}-${memaddress}`. For
+   numeric 0 that yields "0-0", but the fragmented-loop's getMemoryAddress
+   returns formatAddress('000000', token) = "0-000000" for coils
+   specifically (driver hardcodes the string). Mismatched keys ->
+   memory[lookup] undefined -> "Cannot read properties of undefined
+   (reading 'Items')" fires once per coil. Using the string "000000"
+   makes both code paths agree. DIs/IRs/HRs don't hit this because their
+   constants (100000/300000/400000) go through formatAddress directly
+   both times. #}
+{% for c in fuel_modbus_coils %}
+{%   set _ = tag_rows.append('"' ~ c.tag ~ '": {"id":"' ~ c.tag ~ '","name":"' ~ c.tag ~ '","type":"Bool","address":' ~ (c.addr + 1) ~ ',"memaddress":"000000","daq":{"enabled":true,"changed":true,"interval":60,"restored":false}}') %}
+{% endfor %}
+{# OpenPLC's slave-device polling doesn't overlay onto the ST program's
+   %IX0.0/%IW0 addresses. Instead it lands at %IX100.0+ (= Modbus DI 800+)
+   and %IW100+ (= Modbus IR 100+). See webserver.py:895 -- the "100 + counter"
+   offset is hard-coded. So even though fuel_farm.st declares
+   P201_RUN_STS AT %IX0.0 and T101_LEVEL AT %IW0, the values fuelsim is
+   polled for actually live at IX100.0 / IW100. FUXA needs to poll THOSE
+   addresses to see the live data.
+
+   Group vars fuel_modbus_discrete_inputs / _input_registers give the
+   "logical" address (0-10 / 0-10) matching the .st's %IX0.0 / %IW0 layout.
+   Here we translate to the wire-level Modbus address by adding the
+   slave-mapping base offset (+800 for DIs, +100 for IRs) and then +1 for
+   FUXA's 1-based address scheme. #}
+{% for d in fuel_modbus_discrete_inputs %}
+{%   set _ = tag_rows.append('"' ~ d.tag ~ '": {"id":"' ~ d.tag ~ '","name":"' ~ d.tag ~ '","type":"Bool","address":' ~ (d.addr + 800 + 1) ~ ',"memaddress":100000,"daq":{"enabled":true,"changed":true,"interval":60,"restored":false}}') %}
+{% endfor %}
+{% for r in fuel_modbus_input_registers %}
+{%   set divisor = (1.0 / r.scale) | round(0, 'floor') | int %}
+{%   set _ = tag_rows.append('"' ~ r.tag ~ '": {"id":"' ~ r.tag ~ '","name":"' ~ r.tag ~ '","type":"Int16","address":' ~ (r.addr + 100 + 1) ~ ',"memaddress":300000,"divisor":' ~ divisor ~ ',"daq":{"enabled":true,"changed":true,"interval":10,"restored":false}}') %}
+{% endfor %}
+{# HRs mirrored from fuelsim by OpenPLC's slave-device polling land in
+   the INPUT REGISTER area (not HR area) at IR 111+ -- specifically:
+     * ai_size=10 fills OpenPLC IR 100-109
+     * then a single-word padding gap at IR 110 (OpenPLC quirk)
+     * aor_size=8 fills IR 111-118 with fuelsim's HR 0-7
+
+   Verified empirically via pymodbus sweep 2026-07-20: fuelsim HR 0 =
+   5210 shows up at ff-plc-1 IR 111.
+
+   So memaddress goes to INPUT_REGISTERS (300000, not 400000) and the
+   offset is +111 zero-based (+112 in FUXA's 1-based address scheme).
+   Semantic downgrade: these tags become READ-ONLY (which is fine --
+   fuelsim's state_machine is authoritative and we set aow_size=0
+   anyway, so FUXA was never going to write these). #}
+{% for h in fuel_modbus_holding_registers %}
+{%   set _ = tag_rows.append('"' ~ h.tag ~ '": {"id":"' ~ h.tag ~ '","name":"' ~ h.tag ~ '","type":"Int16","address":' ~ (h.addr + 111 + 1) ~ ',"memaddress":300000,"divisor":1,"daq":{"enabled":true,"changed":true,"interval":10,"restored":false}}') %}
+{% endfor %}
+        {{ tag_rows | join(',\n        ') }}
+      }
+    }
+  },
+  "hmi": {
+    "views": [
+      {
+        "id": "v_process_overview",
+        "name": "Process Overview",
+        "profile": { "width": 1280, "height": 720, "bkcolor": "#f5f5f5" },
+        "variables": {},
+        "svgcontent": {{ lookup('file', 'svg_process_overview.svg') | tojson }},
+        "items": {
+{% set items_overview = [] %}
+{# Bind each VAL_<tag> SVG group to the corresponding Modbus tag via
+   svg-ext-value. The SVG element itself carries type="svg-ext-value"
+   (matches FUXA's element-attribute-first widget-type detection at
+   getInTreeIdAndType). The property.ranges array carries a single
+   "unit" entry -- the demo project uses this for the unit suffix
+   (e.g. "l" for liters). #}
+{% for pair in [
+    ('VAL_T101_LEVEL',       'T101_LEVEL',       'T-101 Level %',       0, 100, '%'),
+    ('VAL_T102_LEVEL',       'T102_LEVEL',       'T-102 Level %',       0, 100, '%'),
+    ('VAL_T103_LEVEL',       'T103_LEVEL',       'T-103 Level %',       0, 100, '%'),
+    ('VAL_T101_TEMP',        'T101_TEMP',        'T-101 Temp F',        0, 200, 'F'),
+    ('VAL_HEADER_PRESS',     'HEADER_PRESS',     'Header Pressure psi', 0, 100, 'psi'),
+    ('VAL_LR1_ACTIVE_TRUCK', 'LR1_ACTIVE_TRUCK', 'LR-1 Active Truck',   0, 99, ''),
+    ('VAL_LR1_SRC_TANK',     'LR1_SRC_TANK',     'LR-1 Source Tank',    0, 9, ''),
+    ('VAL_LR1_PRESET_GAL',   'LR1_PRESET_GAL',   'LR-1 Preset Gal',     0, 30000, 'gal'),
+    ('VAL_LR1_FLOW',         'LR1_FLOW',         'LR-1 Flow gpm',       0, 1000, 'gpm'),
+    ('VAL_LR2_ACTIVE_TRUCK', 'LR2_ACTIVE_TRUCK', 'LR-2 Active Truck',   0, 99, ''),
+    ('VAL_LR2_SRC_TANK',     'LR2_SRC_TANK',     'LR-2 Source Tank',    0, 9, ''),
+    ('VAL_LR2_PRESET_GAL',   'LR2_PRESET_GAL',   'LR-2 Preset Gal',     0, 30000, 'gal'),
+    ('VAL_LR2_FLOW',         'LR2_FLOW',         'LR-2 Flow gpm',       0, 1000, 'gpm'),
+] %}
+{%   set _ = items_overview.append('"' ~ pair[0] ~ '": {"id":"' ~ pair[0] ~ '","type":"svg-ext-value","name":"' ~ pair[2] ~ '","property":{"variable":"' ~ pair[1] ~ '","variableSrc":"PLC-FuelFarm","variableId":"' ~ pair[1] ~ '","alarmId":"","alarmSrc":"","alarm":"","alarmColor":"","events":[],"actions":[],"ranges":[{"type":"unit","min":' ~ pair[3] ~ ',"max":' ~ pair[4] ~ ',"color":"","stroke":"","text":"' ~ pair[5] ~ '"}]},"label":"Value"}') %}
+{% endfor %}
+{# Status dots + ESD banner re-added after learning the correct action
+   schema from the demo project's svg-ext-pipe widget:
+
+     "actions": [
+       {
+         "options": {},                    // widget-type-specific (color: {fill,stroke})
+         "range": {"min": "1", "max": "1"},  // strings, not numbers
+         "variableSrc": "PLC-FuelFarm",
+         "variableId": "P201_RUN_STS",     // plain tag name per fcb9085
+         "variable": "P201_RUN_STS",
+         "type": "color"                   // svg-ext bundle exposes: clockwise|
+                                           //   stop|blink|color|hide|show|rotate|move
+       }
+     ]
+
+   Trying `color` type with `options.fill` for the "on" color. If FUXA's
+   getPlaceholderContent still trips on the childless <circle>/<rect>,
+   we'll see the same loadWatch error return and can pivot to a text
+   overlay approach. #}
+{# Status dots + ESD banner color actions deferred as follow-up.
+   Attempted schemas that crashed FUXA's widget-load pipeline:
+     - action.options = {fill:"#..."}          -> silent (no color change)
+     - action.options = {strokeA:null, strokeB:null, fillA:"#c0c0c0",
+                          fillB:"#2c8f3f", interval:1000}  -> pipeline crashes
+   The class le definition (from main.*.js) shows the fill/stroke A/B/
+   interval fields ARE the schema, but null values or field ordering seem
+   to break widget-load somewhere downstream of getPlaceholderContent.
+
+   Reverse-engineering the exact accepted structure from the minified
+   client bundle without a known-good live example (FUXA editor-generated
+   dashboard) is a rabbit hole beyond §4 scope. Deferred to a future
+   session where we can (a) author a working color widget in the FUXA
+   editor via the UI, export the .fuxap, and copy the exact structure;
+   or (b) fetch an example from a FUXA community project.
+
+   Current shipped state:
+     - All numeric readouts (tank levels, temp, pressure, flow, active
+       truck, source tank, preset) render live values -- 90% of the
+       operator utility.
+     - Status dots stay static grey (no color change on boolean flip).
+     - ESD banner stays static green ("SYSTEM NORMAL"). #}
+          {{ items_overview | join(',\n          ') }}
+        }
+      },
+      {
+        "id": "v_rack_detail",
+        "name": "Loading Rack Detail",
+        "profile": { "width": 1280, "height": 720, "bkcolor": "#f5f5f5" },
+        "variables": {},
+        "svgcontent": {{ lookup('file', 'svg_rack_detail.svg') | tojson }},
+        "items": {
+{% set items_detail = [] %}
+{% for pair in [
+    ('VAL_LR1D_ACTIVE_TRUCK', 'LR1_ACTIVE_TRUCK', 'LR-1 Active Truck',   0, 99, ''),
+    ('VAL_LR1D_SRC_TANK',     'LR1_SRC_TANK',     'LR-1 Source Tank',    0, 9, ''),
+    ('VAL_LR1D_PRESET_GAL',   'LR1_PRESET_GAL',   'LR-1 Preset Gal',     0, 30000, 'gal'),
+    ('VAL_LR1D_METER',        'LR1_METER_LO',     'LR-1 Meter low word', 0, 65535, 'gal'),
+    ('VAL_LR1D_FLOW',         'LR1_FLOW',         'LR-1 Flow gpm',       0, 1000, 'gpm'),
+    ('VAL_LR2D_ACTIVE_TRUCK', 'LR2_ACTIVE_TRUCK', 'LR-2 Active Truck',   0, 99, ''),
+    ('VAL_LR2D_SRC_TANK',     'LR2_SRC_TANK',     'LR-2 Source Tank',    0, 9, ''),
+    ('VAL_LR2D_PRESET_GAL',   'LR2_PRESET_GAL',   'LR-2 Preset Gal',     0, 30000, 'gal'),
+    ('VAL_LR2D_METER',        'LR2_METER_LO',     'LR-2 Meter low word', 0, 65535, 'gal'),
+    ('VAL_LR2D_FLOW',         'LR2_FLOW',         'LR-2 Flow gpm',       0, 1000, 'gpm'),
+] %}
+{%   set _ = items_detail.append('"' ~ pair[0] ~ '": {"id":"' ~ pair[0] ~ '","type":"svg-ext-value","name":"' ~ pair[2] ~ '","property":{"variable":"' ~ pair[1] ~ '","variableSrc":"PLC-FuelFarm","variableId":"' ~ pair[1] ~ '","alarmId":"","alarmSrc":"","alarm":"","alarmColor":"","events":[],"actions":[],"ranges":[{"type":"unit","min":' ~ pair[3] ~ ',"max":' ~ pair[4] ~ ',"color":"","stroke":"","text":"' ~ pair[5] ~ '"}]},"label":"Value"}') %}
+{% endfor %}
+{# Status dots (svg-ext-shapes-circle with color action) on the Detail
+   view too. Same structure as Process Overview. Nav button (rect click)
+   still deferred -- needs svg-ext-html_button with onSetView event. #}
+{# Same deferral as Process Overview -- status dot color actions stay
+   out to keep widget-init pipeline healthy for the value widgets that
+   ARE working. See comment in items_overview block above for details. #}
+          {{ items_detail | join(',\n          ') }}
+        }
+      }
+    ],
+    "variables": {}
+  },
+  "charts": []
+}

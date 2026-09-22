@@ -1,0 +1,209 @@
+---
+# =========================================================================
+# splunk_indexer — cluster peer
+# =========================================================================
+# Same reasoning as splunk_cluster_manager: cluster configuration is
+# server.conf state and is written as state. `splunk edit cluster-config`
+# returned success while leaving [clustering] empty, and `show cluster-config`
+# is not a valid subcommand on this build, so the gate that depended on it
+# never gated anything.
+#
+# Runs AFTER the base `splunk` role in the same play. The base role rewrites
+# server.conf in full; these tasks run behind it and re-assert every run, which
+# is what makes the ordering safe rather than merely conventional.
+# =========================================================================
+
+# An earlier deploy ran the base role with a populated `indices`, which wrote
+# system/local/indexes.conf on the peers. That file OVERRIDES the cluster
+# bundle for the same stanza, including repFactor -- the index then works and
+# is silently unreplicated, while cluster-status still reports both factors met
+# because there are no replicated buckets to be short on.
+# group_vars/splunk_indexer.yml stops it being created; this removes what an
+# earlier run already left behind.
+- name: Remove locally-defined indexes so the cluster bundle is authoritative
+  ansible.builtin.file:
+    path: /opt/splunk/etc/system/local/indexes.conf
+    state: absent
+  register: idx_local_indexes
+
+- name: Wait for the Splunk REST API
+  ansible.builtin.uri:
+    url: "https://127.0.0.1:{{ splunk_mgmt_port }}/services/server/info"
+    method: GET
+    user: "{{ splunk_admin }}"
+    password: "{{ splunk_admin_password }}"
+    force_basic_auth: true
+    validate_certs: false
+    status_code: 200
+  register: idx_api
+  retries: 30
+  delay: 10
+  until: idx_api.status == 200
+
+# The manager must be IN MANAGER MODE before a peer joins, not merely
+# answering. An earlier version checked /services/server/info, which any Splunk
+# answers regardless of cluster role -- so the check passed while the manager
+# had an empty [clustering] stanza, and the peers failed with "Could not
+# contact manager" one task later.
+# SPLUNK REPORTS THE LEGACY TERM. server.conf takes `mode = manager` -- the
+# spec file on the host documents exactly that -- but /services/cluster/config
+# reports it back as "master". Both are accepted here because the API and the
+# config file genuinely disagree, and matching only "manager" produced an
+# assertion that could never be true against a correctly configured manager.
+- name: Wait for the cluster manager to be in manager mode
+  ansible.builtin.uri:
+    url: "https://{{ splunk_cluster_manager_ip }}:{{ splunk_mgmt_port }}/services/cluster/config?output_mode=json"
+    method: GET
+    user: "{{ splunk_admin }}"
+    password: "{{ splunk_admin_password }}"
+    force_basic_auth: true
+    validate_certs: false
+    status_code: 200
+    return_content: true
+  register: idx_cm_mode
+  retries: 30
+  delay: 10
+  until: (idx_cm_mode.json.entry[0].content.mode | default('')) in ['manager', 'master']
+
+- name: Configure the [clustering] stanza for peer mode
+  community.general.ini_file:
+    path: /opt/splunk/etc/system/local/server.conf
+    section: clustering
+    option: "{{ item.k }}"
+    value: "{{ item.v }}"
+    mode: '0600'
+    no_extra_spaces: true
+  loop:
+    - { k: 'mode',         v: 'peer' }
+    - { k: 'manager_uri',  v: 'https://{{ splunk_cluster_manager_ip }}:{{ splunk_mgmt_port }}' }
+    - { k: 'pass4SymmKey', v: '{{ splunk_cluster_secret }}' }
+  loop_control:
+    label: "{{ item.k }}"
+  register: idx_clustering
+
+# The replication listener is a BARE stanza -- no keys -- which is how peers
+# stream buckets to each other. Without it a peer joins successfully and then
+# cannot replicate, presenting as the replication factor never being met rather
+# than as a configuration error.
+#
+# lineinfile rather than ini_file: ini_file refuses a section with no options
+# ("Parameter 'value(s)' must be defined"), and the alternative was to invent a
+# key just to satisfy the module. Writing an unverified key into a vendor's
+# config to work around a module constraint is how you get a setting nobody can
+# explain later. The regexp makes it idempotent and replaces the stanza if the
+# port ever changes.
+- name: Open the replication port
+  ansible.builtin.lineinfile:
+    path: /opt/splunk/etc/system/local/server.conf
+    line: "[replication_port://{{ splunk_replication_port }}]"
+    regexp: '^\[replication_port://'
+    state: present
+    mode: '0600'
+  register: idx_replport
+
+- name: Restart Splunk to apply peer mode
+  ansible.builtin.command: /opt/splunk/bin/splunk restart
+  when: (idx_clustering is changed) or (idx_replport is changed) or (idx_local_indexes is changed)
+  changed_when: true
+  # DO NOT judge the restart by its exit code. `splunk restart` returns 1 when
+  # Splunk Web is not up within its own wait, even though splunkd started
+  # cleanly -- observed on pp-splunk-idx02 2026-08-22:
+  #
+  #     Starting splunk server daemon (splunkd)...  Done
+  #     Waiting for web server at http://127.0.0.1:8000 to be available........
+  #     WARNING: web interface does not seem to be available!
+  #     rc=1
+  #
+  # Splunk Web is irrelevant on a cluster peer, and the REST wait immediately
+  # below is the real assertion: it polls until splunkd answers, and fails the
+  # play if it never does. Trusting the CLI's rc failed a whole attempt over a
+  # web server nobody uses, and cascaded -- pp-www then could not connect to an
+  # indexer that had actually restarted fine.
+  failed_when: false
+
+- name: Wait for the REST API after the restart
+  ansible.builtin.uri:
+    url: "https://127.0.0.1:{{ splunk_mgmt_port }}/services/server/info"
+    method: GET
+    user: "{{ splunk_admin }}"
+    password: "{{ splunk_admin_password }}"
+    force_basic_auth: true
+    validate_certs: false
+    status_code: 200
+  register: idx_api2
+  retries: 30
+  delay: 10
+  until: idx_api2.status == 200
+
+# The base role's inputs.conf declares [splunktcp://9997]. An earlier version
+# also ran `splunk enable listen 9997`, which was redundant and failed on the
+# second run because the listener already existed -- with the message on
+# stderr, which the failed_when never checked. Assert the port is open instead
+# of re-issuing a command whose success says nothing.
+- name: The receiving port must actually be listening
+  ansible.builtin.shell: |
+    ss -lnt | grep -c ':{{ splunk_indexer_receiving_port }} ' || true
+  register: idx_listening
+  changed_when: false
+  until: (idx_listening.stdout | trim | int) > 0
+  retries: 12
+  delay: 10
+
+# Assert from the MANAGER's view, not this peer's. A peer holding the config is
+# transport; the manager listing it Up is the outcome.
+#
+# Greps the HOSTNAME, not the IP. The first version searched for the peer's
+# address and `show cluster-status` lists peers by name, so it returned 0
+# against a completely healthy cluster and retried for three minutes before
+# blaming the peers. Predicate validated against real output captured
+# 2026-08-19:
+#
+#    pp-splunk-idx01 <GUID> default
+#         Searchable YES
+#         Status  Up
+#         Bucket Count=6
+- name: The cluster manager must list this peer as Up
+  ansible.builtin.shell: |
+    set -o pipefail
+    /opt/splunk/bin/splunk show cluster-status \
+      -auth '{{ splunk_admin }}:{{ splunk_admin_password }}' 2>/dev/null \
+      | grep -A3 '{{ inventory_hostname }}' \
+      | grep -c 'Status  *Up' || true
+  args:
+    executable: /bin/bash
+  delegate_to: "{{ groups['splunk_cluster_manager'][0] }}"
+  register: idx_peer_up
+  changed_when: false
+  until: (idx_peer_up.stdout | trim | int) > 0
+  retries: 12
+  delay: 15
+
+# The factors are the actual outcome of a clustered build. Peers can be Up while
+# nothing replicates -- that is exactly what a locally-defined index or a
+# missing [replication_port://] produces, and both look healthy peer-by-peer.
+# run_once because it is a property of the cluster, not of a host.
+- name: The cluster must report both factors met
+  ansible.builtin.shell: |
+    set -o pipefail
+    /opt/splunk/bin/splunk show cluster-status \
+      -auth '{{ splunk_admin }}:{{ splunk_admin_password }}' 2>/dev/null \
+      | grep -cE '(Replication|Search) factor met' || true
+  args:
+    executable: /bin/bash
+  delegate_to: "{{ groups['splunk_cluster_manager'][0] }}"
+  run_once: true
+  register: idx_factors
+  changed_when: false
+  until: (idx_factors.stdout | trim | int) >= 2
+  retries: 12
+  delay: 15
+  failed_when: (idx_factors.stdout | trim | int) < 2
+
+- name: Report peer state
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }}
+      ({{ hostvars[inventory_hostname].network_interfaces[1].ipv4.address }}):
+      peer of {{ splunk_cluster_manager_ip }}, receiving on
+      {{ splunk_indexer_receiving_port }}, replicating on
+      {{ splunk_replication_port }} — manager reports Up.

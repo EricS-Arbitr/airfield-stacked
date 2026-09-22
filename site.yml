@@ -1,0 +1,1887 @@
+---
+# airfield-range site.yml
+#
+# Play order is deliberate: management-plane plays (Init, adapter/NM
+# pre-config, common baseline, GNOME suppression) run FIRST while the data
+# plane is still un-routed. Ansible reaches every host on the mgmt subnet
+# (10.255.240.0/20), which is L2-flat and does not depend on VyOS/pfSense
+# state, so these plays succeed even before the network play runs.
+#
+# Network plays (VyOS, pfSense) then bring the data plane up so the
+# foundation tier (NTP, AD, DNS, DHCP) and everything downstream can land.
+#
+# Deviates from CLAUDE.md §10's documented network-first order by design.
+
+# THE SO MIRROR RUNS FIRST, ahead of the range baseline, for two reasons.
+#   (a) FAIL FAST. The mirror is a hard prerequisite for phases 30/40/50.
+#       Discovering it is broken after a multi-hour baseline wastes the whole
+#       run; discovering it in minutes costs nothing.
+#   (b) OVERLAP. It kicks the container-image build off in the BACKGROUND and
+#       returns, so the baseline and phases 20/30 run while it downloads.
+#       40-manager blocks on the artifacts.
+# Safe to hoist: the controller (`ansible`) is in [ansible_controller],
+# [infrastructure] and [range] only -- never [linux] -- and no baseline play
+# targets any of those, so nothing the baseline does is a precondition here.
+# Must still precede 30: so_base fetches the pinned SO source from it.
+- import_playbook: playbooks/10-mirror.yml
+
+# Preflight -- runs BEFORE init because if a prior deploy attempt
+# half-joined fops-dc01 via Install-ADDSDomain, unqualified `simspace`
+# NTLM is rejected and init's win_ping times out for 30 min per attempt.
+# The heal role uses local .\simspace auth (which still works during
+# half-join), detects state, and self-heals via bs-dc01 metadata cleanup
+# + local registry reset + reboot. Idempotent no-op on clean hosts.
+# See UPSTREAM_FIXES.md 2026-07-13.
+- name: dcpromo(child) — self-heal half-join residue before init
+  hosts: pdc_fops
+  gather_facts: false
+  any_errors_fatal: false
+  roles:
+    - dcpromo_child_heal
+  tags:
+    - init
+    - dcpromo_child_heal
+
+# NO any_errors_fatal HERE, AND THAT IS THE POINT.
+#
+# It was `true` until 2026-09-15. Under that flag, one unreachable host does
+# not fail alone: Ansible marks EVERY host in the play failed, aborts the play,
+# and drops all of them from every later play. Measured on this range that day
+# -- four Windows hosts (bs-hq02, bs-hq04, bs-hq05, bs-it01) never finished
+# booting inside init's wait, and all 48 Windows hosts left the deploy. 44 of
+# them were healthy. The range built Linux-only and failed 4.5 hours later at
+# the Fleet coverage check, having never attempted a single Windows task.
+# Four slow hosts, forty-eight casualties.
+#
+# Unreachable hosts now fall out INDIVIDUALLY. The report below names them the
+# moment init finishes, so the failure is visible in minutes rather than at the
+# end of the run. The deploy deliberately CONTINUES: every reachable host still
+# gets built, and the end-of-run coverage assertions (playbooks/75-endpoint.yml
+# "Fail if any agent target is absent from Fleet") remain the hard gate. A
+# deploy with missing hosts still fails -- it just fails having done all the
+# work it could, which is what makes the retry cheap.
+- name: Init
+  hosts: windows
+  gather_facts: false
+  roles:
+    - init
+  tasks:
+    # ansible_play_hosts_all is every host the play started with;
+    # ansible_play_hosts is those still alive. The difference is exactly the
+    # set that went unreachable or failed inside init.
+    - name: Report Windows hosts that never came online
+      ansible.builtin.debug:
+        msg: |
+          ===================================================================
+          {{ (ansible_play_hosts_all | difference(ansible_play_hosts)) | length }} of {{ ansible_play_hosts_all | length }} WINDOWS HOSTS DID NOT COME ONLINE
+
+            {{ (ansible_play_hosts_all | difference(ansible_play_hosts)) | sort | join(', ') }}
+
+          Each waited up to {{ init_wait_timeout }}s for WinRM and never
+          answered. They are excluded from every later play, so they will have
+          no AD join, no Sysmon and no Elastic Agent.
+
+          The deploy CONTINUES for the {{ ansible_play_hosts | length }} hosts that did come up, and
+          will fail at the end-of-run coverage checks naming exactly what is
+          missing. Confirm in the SimSpace console that these VMs are powered
+          on and finished booting, then re-run.
+          ===================================================================
+      run_once: true
+      when: (ansible_play_hosts_all | difference(ansible_play_hosts)) | length > 0
+  tags:
+    - init
+
+- name: Windows adapter rename pre-config
+  hosts: windows
+  gather_facts: false
+  tasks:
+    - name: Rename Windows adapters to canonical Ethernet0/EthernetN by ifIndex order
+      ansible.windows.win_powershell:
+        script: |
+          $adapters = @(Get-NetAdapter | Sort-Object ifIndex)
+          $names = @($adapters | ForEach-Object { $_.Name })
+          $count = $adapters.Count
+
+          # If all expected canonical names already exist among the adapters,
+          # the image's naming is correct — leave it alone. Doing otherwise
+          # risks swapping the mgmt/data-plane mapping when ifIndex ordering
+          # doesn't match the image's existing Name ordering (which it often
+          # doesn't on SimSpace Windows 10/11 images).
+          $allCanonical = $true
+          for ($i = 0; $i -lt $count; $i++) {
+            if ($names -notcontains "Ethernet$i") { $allCanonical = $false; break }
+          }
+          if ($allCanonical) {
+            $Ansible.Changed = $false
+            Write-Output "All adapter names already canonical; no rename."
+            return
+          }
+
+          # Non-canonical naming (e.g. Server 2019 image ships with
+          # "Ethernet"/"Ethernet 2"). Rename via a temp-name pass first so
+          # the final names can't collide with existing names mid-loop.
+          $tempPrefix = "_ppRename_"
+          $tempIdx = 0
+          foreach ($a in $adapters) {
+            Rename-NetAdapter -Name $a.Name -NewName "$tempPrefix$tempIdx" -ErrorAction Stop
+            $tempIdx++
+          }
+          $renamed = @()
+          $idx = 0
+          foreach ($a in $adapters) {
+            $target = "Ethernet$idx"
+            Rename-NetAdapter -Name "$tempPrefix$idx" -NewName $target -ErrorAction Stop
+            $renamed += "$($a.Name) -> $target"
+            $idx++
+          }
+          $Ansible.Changed = $true
+          Write-Output ($renamed -join '; ')
+  tags:
+    - common
+    - win_adapter_rename
+
+- name: Linux NM managed-devices pre-config
+  hosts: linux
+  gather_facts: false
+  become: true
+  tasks:
+    # apt needs the corp proxy reachable before any Ubuntu archive call.
+    # `common` drops this same file later but runs in a later play; do it
+    # here too so this play's `apt install network-manager` can reach Nexus.
+    - name: Set apt proxy from group_vars/all.yml
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/95-airfield-proxy
+        content: |
+          Acquire::http::Proxy "http://{{ inet_proxy_addr }}:{{ inet_proxy_port }}";
+          Acquire::https::Proxy "http://{{ inet_proxy_addr }}:{{ inet_proxy_port }}";
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Ensure NetworkManager is installed
+      ansible.builtin.apt:
+        name: network-manager
+        state: present
+
+    - name: Opt eth* devices into NetworkManager management
+      ansible.builtin.copy:
+        dest: /etc/NetworkManager/conf.d/99-airfield-eth-managed.conf
+        content: |
+          [keyfile]
+          unmanaged-devices=
+
+          [device-eth-managed]
+          match-device=interface-name:eth*
+          managed=true
+        owner: root
+        group: root
+        mode: '0644'
+      register: nm_managed_conf
+
+    - name: Restart NetworkManager if config changed
+      ansible.builtin.systemd:
+        name: NetworkManager
+        state: restarted
+        enabled: true
+      when: nm_managed_conf.changed
+
+    - name: Wait for NetworkManager to settle after restart
+      ansible.builtin.pause:
+        seconds: 3
+      when: nm_managed_conf.changed
+
+    # Drive the loop from facts so multi-NIC OT bridges (e.g. control-room-hmi
+    # with eth0/eth1/eth2) get every eth managed, not just eth0/eth1.
+    - name: Gather network facts for eth* enumeration
+      ansible.builtin.setup:
+        gather_subset: network
+
+    - name: Force every eth device into managed state at runtime
+      ansible.builtin.shell: |
+        nmcli device set "{{ item }}" managed yes
+      loop: "{{ ansible_interfaces | select('match', '^eth[0-9]+$') | list }}"
+      register: nmcli_set_managed
+      changed_when: "'successfully' in (nmcli_set_managed.stdout | default(''))"
+      failed_when: false
+  tags:
+    - common
+    - nm_managed_eth
+
+- name: Common Role
+  hosts: windows,linux
+  gather_facts: true
+  roles:
+    - common
+  tags:
+    - common
+
+# The Ubuntu Desktop images ship with gnome-initial-setup enabled, which
+# pops the "Connect Your Online Accounts" / Welcome wizard the first time
+# anyone logs into the GUI. Drop the documented "wizard already seen" flag
+# file under each existing user's ~/.config and in /etc/skel so future
+# users inherit it. gnome-initial-setup checks for this file and exits
+# silently when it contains "yes".
+- name: Suppress GNOME initial-setup wizard on Linux desktops
+  hosts: linux
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Find user home directories under /home
+      ansible.builtin.find:
+        paths: /home
+        file_type: directory
+        depth: 1
+      register: gnome_user_homes
+
+    - name: Ensure ~/.config exists for each user
+      ansible.builtin.file:
+        path: "{{ item.path }}/.config"
+        state: directory
+        owner: "{{ item.pw_name }}"
+        group: "{{ item.gr_name }}"
+        mode: '0755'
+      loop: "{{ gnome_user_homes.files }}"
+
+    - name: Mark GNOME initial-setup done for each existing user
+      ansible.builtin.copy:
+        dest: "{{ item.path }}/.config/gnome-initial-setup-done"
+        content: "yes\n"
+        owner: "{{ item.pw_name }}"
+        group: "{{ item.gr_name }}"
+        mode: '0644'
+      loop: "{{ gnome_user_homes.files }}"
+
+    - name: Ensure /etc/skel/.config exists for future users
+      ansible.builtin.file:
+        path: /etc/skel/.config
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Mark GNOME initial-setup done in /etc/skel
+      ansible.builtin.copy:
+        dest: /etc/skel/.config/gnome-initial-setup-done
+        content: "yes\n"
+        owner: root
+        group: root
+        mode: '0644'
+  tags:
+    - common
+    - gnome_initial_setup
+
+- name: Vyos Role
+  hosts: vyos
+  gather_facts: false
+  roles:
+    - vyos
+  tags:
+    - vyos
+
+# The customer's vyos role's `static_route` field is a single dict, not a
+# list. Hosts that need more than one static (e.g. an OT umbrella back-stop
+# alongside the default) declare them in host_vars as
+# `extra_static_routes: [{network, next_hop, descr}]`. This play pushes them
+# via vyos_config; the role's auto `redistribute static` picks them up.
+- name: Additional VyOS static routes
+  hosts: vyos
+  gather_facts: false
+  tasks:
+    - name: Push extra static routes via vyos_config
+      vyos.vyos.vyos_config:
+        match: line
+        lines:
+          - "set protocols static route {{ item.network }} next-hop {{ item.next_hop }}"
+        save: true
+      loop: "{{ extra_static_routes | default([]) }}"
+      when: extra_static_routes is defined and (extra_static_routes | length) > 0
+  tags:
+    - vyos
+    - extra_static_routes
+
+# The SimSpace VyOS image bakes a stale `0.0.0.0/0 next-hop <X>` entry
+# for every /24 "departmental" interface IP on the box. On routers with
+# multiple such interfaces (bs-core-rtr, bs-ops-rtr, bs-sec-rtr, etc.) this
+# creates competing equal-cost defaults whose next-hops resolve to the
+# router's OWN connected IPs. FRR refuses to install a default whose
+# next-hop is a local interface and ECMPs the whole route out of the FIB —
+# leaving the router with no default at all. Symptom: `show ip route` has
+# no `S>* 0.0.0.0/0` line; downstream subnets see "destination unreachable".
+#
+# Each affected host declares `extra_static_routes_remove: [{network,
+# next_hop}]` in host_vars. This play issues the matching `delete` so the
+# only default left is the one the customer `vyos` role just set from
+# `static_route`. Log all new self-loop discoveries in UPSTREAM_FIXES.md.
+- name: Remove stale VyOS static routes (image-baked self-loop defaults)
+  hosts: vyos
+  gather_facts: false
+  tasks:
+    - name: Delete stale static routes via vyos_config
+      vyos.vyos.vyos_config:
+        match: line
+        lines:
+          - "delete protocols static route {{ item.network }} next-hop {{ item.next_hop }}"
+        save: true
+      loop: "{{ extra_static_routes_remove | default([]) }}"
+      when: extra_static_routes_remove is defined and (extra_static_routes_remove | length) > 0
+  tags:
+    - vyos
+    - extra_static_routes_remove
+
+# Architectural shift (CLAUDE.md §3 row 8): corp IGP is OSPF area 0 + eBGP
+# at the WAN edge only — no internal iBGP mesh. Setting `bgp: []` in
+# host_vars stops new pushes but doesn't remove BGP a prior run may have
+# left in the running config. This play deletes the entire `protocols bgp`
+# subtree on hosts that opt in via `remove_vyos_bgp: true`. bs-edge-rtr
+# (eBGP AS 65002 to bs-edge-fw) intentionally keeps its `bgp:` block.
+- name: Remove stale VyOS iBGP (architectural shift to OSPF-IGP)
+  hosts: vyos
+  gather_facts: false
+  tasks:
+    - name: Delete protocols bgp via vyos_config
+      vyos.vyos.vyos_config:
+        lines:
+          - "delete protocols bgp"
+        save: true
+      when: remove_vyos_bgp | default(false)
+  tags:
+    - vyos
+    - remove_vyos_bgp
+
+# =============================================================================
+# Range-wide IPv6 disable
+# =============================================================================
+# Windows is already covered by the customer `common` role (sets HKLM
+# Tcpip6\Parameters\DisabledComponents=0xFF via DSC). pfSense is covered
+# by the pfsense_firewall role (config.xml <ipv6allow> removed, sysctl
+# net.inet6.ip6.auto_linklocal=0, existing fe80:: addrs deleted). Linux
+# and VyOS have no baseline handling and are covered by these two plays.
+
+- name: Disable IPv6 — Linux
+  hosts: linux
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Drop /etc/sysctl.d/99-disable-ipv6.conf
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-disable-ipv6.conf
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          # Managed by Ansible (site.yml). Range-wide IPv6 disable --
+          # no IPv6 anywhere on any Linux host in this range.
+          net.ipv6.conf.all.disable_ipv6 = 1
+          net.ipv6.conf.default.disable_ipv6 = 1
+          net.ipv6.conf.lo.disable_ipv6 = 1
+      register: sysctl_v6
+
+    - name: Apply sysctl immediately (no reboot)
+      ansible.builtin.command: sysctl --system
+      when: sysctl_v6.changed
+      changed_when: false
+  tags:
+    - ipv6
+    - disable_ipv6
+
+# `set system ipv6 disable` toggles the kernel flag but existing IPv6
+# sessions/interfaces stay up until reboot. Reboot is required for a
+# fully-clean IPv4-only state. `wait_for` polls the mgmt SSH port from
+# the controller so the deploy resumes cleanly after the box comes back.
+# =============================================================================
+# VyOS — remove the phantom serial console
+# =============================================================================
+# Every VyOS node in this image ships:
+#
+#   set system console device ttyS0 speed '115200'
+#
+# but /dev/ttyS0 is not a working tty on these VMs. systemd starts
+# serial-getty@ttyS0, agetty exits with "/dev/ttyS0: not a tty", systemd
+# restarts it, forever. Measured on a PowerPlant router 2026-09-10:
+#
+#   serial-getty@ttyS0.service: Scheduled restart job, restart counter is at 5645
+#
+# One cycle per ~10s, about 16 hours of uptime. Five log lines per cycle
+# across the routers is roughly 200,000 junk messages a day landing in
+# the central syslog store -- which is why VyOS syslog looked worthless when we
+# sampled it for SIEM ingestion: the signal is real, it is just buried.
+#
+# Deleted in CONFIG, not masked in systemd. VyOS regenerates unit state from
+# its own configuration, so a `systemctl mask` would be undone by the next
+# commit or boot. Nothing is lost: this console has never worked on this
+# image, so there is no functioning access path to remove.
+#
+# Checked before deleting because VyOS errors on deleting an absent node,
+# which would make a re-run fail rather than no-op.
+- name: VyOS — remove the phantom serial console (systemd restart loop)
+  hosts: vyos
+  gather_facts: false
+  tasks:
+    - name: Check whether the ttyS0 console is configured
+      vyos.vyos.vyos_command:
+        commands:
+          - "show configuration commands | match \"console device ttyS0\""
+      register: vyos_console_cfg
+      changed_when: false
+      failed_when: false
+
+    - name: Delete the ttyS0 console device
+      vyos.vyos.vyos_config:
+        lines:
+          - "delete system console device ttyS0"
+        save: true
+      when: "'ttyS0' in (vyos_console_cfg.stdout | default([''], true) | join(' '))"
+      register: vyos_console_del
+
+    - name: Stop the flapping getty now, so the fix takes effect without a reboot
+      vyos.vyos.vyos_command:
+        commands:
+          - "run sudo systemctl stop serial-getty@ttyS0.service"
+      when: vyos_console_del.changed | default(false)
+      changed_when: true
+      failed_when: false
+  tags:
+    - vyos
+    - vyos_console
+
+- name: Disable IPv6 — VyOS
+  hosts: vyos
+  gather_facts: false
+  tasks:
+    - name: Disable IPv6 stack + forwarding via vyos_config
+      vyos.vyos.vyos_config:
+        lines:
+          - "set system ipv6 disable"
+          - "set system ipv6 disable-forwarding"
+        save: true
+      register: vyos_v6
+
+    - name: Trigger reboot on VyOS
+      vyos.vyos.vyos_command:
+        commands:
+          - command: "reboot now"
+            prompt: "Are you sure you want to reboot"
+            answer: "y"
+      when: vyos_v6.changed
+      ignore_errors: true       # SSH drops mid-command; expected
+
+    - name: Wait for VyOS SSH to come back
+      ansible.builtin.wait_for:
+        host: "{{ ansible_host }}"
+        port: 22
+        delay: 30
+        timeout: 300
+      delegate_to: localhost
+      when: vyos_v6.changed
+
+    # meta: reset_connection ignores `when:` per Ansible docs -- always
+    # run it. Harmless if the box didn't reboot (just re-opens the
+    # network_cli session for the next play).
+    - name: Reset ansible connection so subsequent plays reconnect fresh
+      ansible.builtin.meta: reset_connection
+  tags:
+    - ipv6
+    - disable_ipv6
+
+- name: pfSense firewalls
+  hosts: pfsense
+  gather_facts: false
+  roles:
+    - pfsense_firewall
+  tags:
+    - pfsense
+
+# Belt-and-suspenders rebind that fires BETWEEN the pfSense play and the AD
+# plays. The pfsense_firewall role's own post-flight + post-handler tasks
+# only catch drift that happens DURING the play; pfSense's write_config()
+# can trigger a background interface refresh that drops a data-plane vmx
+# IP seconds-to-minutes AFTER the play ends. We've hit this 3+ times on
+# vmx1 (SWITCH_3) on bs-ops-fw, and each time Eng/SOC hosts then fail to
+# join blackstone.mil with "domain not contacted" because the OSPF-learned route
+# can't install through an interface with no kernel IP.
+#
+# This play: brief settle pause + same rebind PHP, scheduled right before
+# anything that needs routing-through-pfSense.
+- name: pfSense — pre-AD interface re-verify (catches delayed vmx drop)
+  hosts: pfsense
+  gather_facts: false
+  tasks:
+    - name: Settle pause for any delayed pfSense reconfig
+      ansible.builtin.pause:
+        seconds: 20
+      run_once: true
+
+    - name: Re-bind any data-plane interface whose kernel IP has drifted
+      ansible.builtin.shell: |
+        php -r 'require_once("/etc/inc/config.inc");
+                require_once("/etc/inc/interfaces.inc");
+                $want_descrs = json_decode(getenv("PFS_DESCRS"), true);
+                $ifs = config_get_path("interfaces", []);
+                $fixed = [];
+                foreach ($ifs as $key => $cfg) {
+                  if ($key === "lan") continue;
+                  $descr = $cfg["descr"] ?? "";
+                  $want_ip = $cfg["ipaddr"] ?? "";
+                  $phys = $cfg["if"] ?? "";
+                  $subnet = $cfg["subnet"] ?? "";
+                  if (!in_array($descr, $want_descrs, true)) continue;
+                  if (!$want_ip || $want_ip === "dhcp" || !$phys || !$subnet) continue;
+                  $cur = trim(shell_exec("ifconfig " . escapeshellarg($phys) .
+                    " 2>/dev/null | awk \"/inet /{print \\$2; exit}\""));
+                  if ($cur !== $want_ip) {
+                    shell_exec("pkill -f \"dhclient.*" . escapeshellarg($phys) . "\" 2>/dev/null");
+                    interface_configure($key);
+                    shell_exec("ifconfig " . escapeshellarg($phys) . " inet " .
+                      escapeshellarg($want_ip) . "/" . intval($subnet) . " up 2>&1");
+                    $fixed[] = $key . "(" . $descr . ":" . $phys . ":" . $cur . "->" . $want_ip . ")";
+                  }
+                }
+                if (count($fixed) > 0) {
+                  echo "PRE-AD FIXED: " . implode(",", $fixed) . "\n";
+                } else {
+                  echo "PRE-AD OK: all data-plane interfaces still bound\n";
+                }'
+      environment:
+        PFS_DESCRS: "{{ pfsense_interfaces | map(attribute='descr') | list | to_json }}"
+      register: pfsense_pre_ad
+      changed_when: "'PRE-AD FIXED' in pfsense_pre_ad.stdout"
+      when: pfsense_interfaces is defined and (pfsense_interfaces | length) > 0
+  tags:
+    - pfsense
+    - pfsense_pre_ad_rebind
+    # Pull this rebind into any AD-foundation tag scope so it's unmissable —
+    # we've been hitting the case where users tag `domain_member_retry` and
+    # the rebind sits silently outside the scope while Eng/SOC fail.
+    - strip_apipa
+    - domain_member_retry
+    - dcpromo
+    - join_blackstone
+    - join_fops
+    - create_users
+    - dns
+
+# =============================================================================
+# Foundation tier — Active Directory (blackstone.mil + fops.blackstone.mil)
+# =============================================================================
+# Single-forest, two-domain build: bs-dc01 promotes the FOREST ROOT
+# (blackstone.mil), then fops-dc01 promotes the CHILD DOMAIN
+# (fops.blackstone.mil, parent=blackstone.mil). Order matters -- the child
+# domain's Install-ADDSDomain call authenticates against the parent forest,
+# so the parent must be up FIRST. Two separate plays enforce the serial:
+# dcpromo (forest root) completes before dcpromo (child domain) starts.
+#
+# The dcpromo role detects mode based on whether `parent_domain_name` is set
+# in the host's group_vars: absent = forest root (microsoft.ad.domain),
+# present = child domain (win_powershell Install-ADDSDomain -DomainType
+# ChildDomain).
+
+- name: dcpromo (forest root — blackstone.mil)
+  hosts: pdc_blackstone
+  gather_facts: false
+  roles:
+    - dcpromo
+  tags:
+    - dcpromo
+    - dcpromo_forest
+
+- name: dcpromo (child domain — fops.blackstone.mil)
+  hosts: pdc_fops
+  gather_facts: false
+  roles:
+    - dcpromo
+  tags:
+    - dcpromo
+    - dcpromo_child
+
+# ALWAYS runs after dcpromo(child) attempts -- captures forest + child-DC
+# state from bs-dc01 (which stays reachable through the whole flow), so
+# that even if dcpromo(child) reported UNREACHABLE, we get diagnostic
+# evidence of what actually happened. Written to a controller-side file
+# for later analysis. See UPSTREAM_FIXES.md 2026-07-13.
+- name: Post-dcpromo diagnostic snapshot (always runs)
+  hosts: pdc_blackstone
+  gather_facts: false
+  any_errors_fatal: false
+  vars:
+    ansible_user: Administrator
+    ansible_password: "{{ domain_admin_password }}"
+  tasks:
+    - name: Snapshot forest + child DC state
+      ansible.windows.win_shell: |
+        "=== $(Get-Date -Format o) POST-DCPROMO DIAGNOSTIC SNAPSHOT ==="
+        ""
+        "--- forest domains ---"
+        try { (Get-ADForest -ErrorAction Stop).Domains } catch { "ERROR: $($_.Exception.Message)" }
+        ""
+        "--- CrossRefs in Partitions ---"
+        try {
+          Get-ADObject -SearchBase "CN=Partitions,CN=Configuration,DC=blackstone,DC=mil" -Filter * -Properties dnsRoot,nCName -ErrorAction Stop |
+            Select-Object Name,dnsRoot,nCName | Format-Table -AutoSize | Out-String
+        } catch { "ERROR: $($_.Exception.Message)" }
+        ""
+        "--- Domain controllers ---"
+        try { Get-ADDomainController -Filter * -ErrorAction Stop | Select-Object Name,Site,Domain | Format-Table -AutoSize | Out-String } catch { "ERROR: $($_.Exception.Message)" }
+        ""
+        "--- DNS delegation in blackstone.mil ---"
+        try { Get-DnsServerResourceRecord -ZoneName blackstone.mil -RRType NS -ErrorAction Stop | Select-Object HostName,RecordType | Format-Table | Out-String } catch { "ERROR: $($_.Exception.Message)" }
+        ""
+        "--- fops-dc01 LDAP 172.31.3.11:389 up? ---"
+        (Test-NetConnection 172.31.3.11 -Port 389 -InformationLevel Quiet -WarningAction SilentlyContinue)
+        ""
+        "--- fops-dc01 mgmt 10.255.240.120:5985 (WinRM) up? ---"
+        (Test-NetConnection 10.255.240.120 -Port 5985 -InformationLevel Quiet -WarningAction SilentlyContinue)
+        ""
+        "--- Try Install-ADDSDomain log from fops-dc01 via SMB ---"
+        try { Get-Content '\\172.31.3.11\c$\ProgramData\dcpromo-install.log' -ErrorAction Stop } catch { "ERROR reading log: $($_.Exception.Message)" }
+        ""
+        "--- Replication metadata for fops.blackstone.mil ---"
+        try { repadmin /showrepl fops-dc01 /csv 2>&1 } catch { "ERROR: $($_.Exception.Message)" }
+        ""
+        "=== END SNAPSHOT ==="
+      register: dc_snapshot
+      changed_when: false
+      failed_when: false
+
+    - name: Show snapshot in ansible output
+      ansible.builtin.debug:
+        var: dc_snapshot.stdout_lines
+
+    - name: Save snapshot to controller-side file
+      ansible.builtin.copy:
+        content: "{{ dc_snapshot.stdout }}"
+        dest: "/tmp/diagnostic-postdcpromo-{{ lookup('pipe', 'date +%Y%m%d-%H%M%S') }}.txt"
+      delegate_to: localhost
+      become: false
+  tags:
+    - dcpromo
+    - dcpromo_diag
+
+# Chicken-and-egg fix: create_users on the next play needs to WinRM-connect
+# to fops-dc01 as unqualified `simspace` -- but post-promotion,
+# fops.blackstone.mil\simspace doesn't exist yet, so NTLM auth is rejected
+# (bs-dc01 doesn't hit this: its local SAM simspace survives Install-ADDSForest
+# and NTLM falls back to it; fops-dc01 doesn't get the same fallback after
+# Install-ADDSDomain child promotion for reasons still unclear).
+#
+# This play delegates to bs-dc01 (which stays reachable) and uses its
+# blackstone.mil\Administrator EA credential to create simspace directly
+# in fops.blackstone.mil via AD RPC (bypasses fops-dc01 WinRM). Once
+# simspace exists as a fops.blackstone.mil DA, create_users can auth to
+# fops-dc01 normally on default unqualified creds.
+#
+# Removes the need for a temporary blackstone.mil\Administrator override
+# in host_vars/fops-dc01.yml on future fresh deploys. See UPSTREAM_FIXES.md
+# 2026-07-14.
+- name: Bootstrap simspace as fops.blackstone.mil Domain Admin (delegated from bs-dc01)
+  hosts: pdc_blackstone
+  gather_facts: false
+  any_errors_fatal: false
+  vars:
+    # Hard-coded child/parent domain names -- referring to fops-dc01s
+    # host_vars via hostvars[] at task-vars level was fragile in early
+    # tests. These match group_vars/fops.yml (child) + group_vars/all.yml
+    # (parent) and are stable for the project.
+    bootstrap_child_domain: "fops.blackstone.mil"
+    bootstrap_parent_domain: "blackstone.mil"
+    # 40 x 15s = 10 minutes. ADWS on a freshly promoted child DC is usually up
+    # within two or three; ten leaves room for a slow post-promotion reboot
+    # without letting a genuinely broken child domain hang the deploy.
+    bootstrap_child_adws_retries: 40
+  tasks:
+    # ADWS, NOT AD DS -- and that distinction is the whole bug.
+    #
+    # Get-ADUser / Get-ADDomain do not speak LDAP. They talk to Active
+    # Directory Web Services on TCP 9389, which starts AFTER AD DS on a
+    # freshly promoted DC and after its post-promotion reboot. So there is a
+    # window -- minutes, not seconds -- where fops-dc01 is promoted, DNS
+    # resolves it, LDAP answers, and ADWS still does not. The failure names it
+    # exactly: "...or it does not have the Active Directory Web Services
+    # running." Observed on airfield 2026-09-15: fops-dc01 finished its own
+    # play clean (ok=27, failed=0) and this task failed against it 
+    # seconds later.
+    #
+    # THE COST OF NOT GATING THIS IS THE WHOLE RANGE. bs-dc01 is the sole
+    # member of [pdc_blackstone]. When this task fails, bs-dc01 is marked
+    # failed and dropped from every later play -- Create Users, dns, and BOTH
+    # domain joins all target it. One transient race takes out the forest root
+    # and nothing downstream of AD can be built.
+    #
+    # Probe with Get-ADDomain rather than a port check on 9389: it exercises
+    # the same ADWS path, the same credential and the same -Server target the
+    # create step uses, so a pass here means the next task's precondition
+    # actually holds rather than merely resembling it.
+    - name: Preflight — the child domain answers ADWS
+      ansible.windows.win_shell: |
+        $sec = ConvertTo-SecureString "{{ domain_admin_password }}" -AsPlainText -Force
+        $cred = New-Object System.Management.Automation.PSCredential(
+                  "{{ bootstrap_parent_domain }}\Administrator", $sec)
+        try {
+          $d = Get-ADDomain -Server "{{ bootstrap_child_domain }}" `
+                            -Credential $cred -ErrorAction Stop
+          if ($d.DNSRoot) { "CHILD_ADWS_READY" } else { "CHILD_ADWS_NOT_READY" }
+        } catch { "CHILD_ADWS_NOT_READY" }
+      register: child_adws
+      # no_log: the command embeds domain_admin_password, and Ansible echoes
+      # `cmd` verbatim on failure. Nothing is lost here -- this task already
+      # carries failed_when: false and the task below reports the reason
+      # without referencing the command.
+      no_log: true
+      until: "'CHILD_ADWS_READY' in (child_adws.stdout | default(''))"
+      retries: "{{ bootstrap_child_adws_retries }}"
+      delay: 15
+      changed_when: false
+      failed_when: false
+
+    # Fail HERE, with the reason, rather than inside the create step. Same
+    # shape as additional_dc's locatable-DC gate: assert the precondition the
+    # next task depends on, and say what to check when it does not hold.
+    - name: Fail if the child domain never answered ADWS
+      ansible.builtin.fail:
+        msg: |
+          {{ bootstrap_child_domain }} did not answer Active Directory Web
+          Services from {{ inventory_hostname }} after
+          {{ (bootstrap_child_adws_retries | int) * 15 }}s.
+
+          simspace has NOT been created in the child domain, so anything that
+          authenticates as {{ bootstrap_child_domain }}\simspace will fail.
+
+          Check, in order:
+            1. the ADWS service on the child PDC:
+                 Get-Service ADWS      (should be Running)
+            2. that this host resolves the child domain:
+                 Resolve-DnsName _ldap._tcp.dc._msdcs.{{ bootstrap_child_domain }} -Type SRV
+            3. that the child PDC finished promotion and rebooted -- a DC that
+               is still mid-promotion answers DNS but not ADWS
+      when: "'CHILD_ADWS_READY' not in (child_adws.stdout | default(''))"
+
+    - name: Create simspace in the child domain
+      ansible.windows.win_shell: |
+        $sec = ConvertTo-SecureString "{{ domain_admin_password }}" -AsPlainText -Force
+        $cred = New-Object System.Management.Automation.PSCredential(
+                  "{{ bootstrap_parent_domain }}\Administrator", $sec)
+        $childDomain = "{{ bootstrap_child_domain }}"
+        try {
+          $existing = Get-ADUser -Filter "SamAccountName -eq 'simspace'" `
+                                 -Server $childDomain -Credential $cred `
+                                 -ErrorAction SilentlyContinue
+          if (-not $existing) {
+            New-ADUser -Name simspace -SamAccountName simspace `
+                       -AccountPassword $sec -PasswordNeverExpires $true -Enabled $true `
+                       -Server $childDomain -Credential $cred
+            Add-ADGroupMember -Identity "Domain Admins" -Members simspace `
+                              -Server $childDomain -Credential $cred
+            "CREATED"
+          } else {
+            Add-ADGroupMember -Identity "Domain Admins" -Members simspace `
+                              -Server $childDomain -Credential $cred `
+                              -ErrorAction SilentlyContinue
+            "EXISTS"
+          }
+        } catch {
+          "FAILED: $($_.Exception.Message)"
+          throw
+        }
+      register: bootstrap_simspace
+      changed_when: "'CREATED' in bootstrap_simspace.stdout"
+      # THIS TASK LEAKED THE DOMAIN ADMIN PASSWORD. On 2026-09-15 it failed and
+      # Ansible printed the whole `cmd`, including
+      # ConvertTo-SecureString "<password>", into the run output -- which
+      # deploy.sh tees to /var/log/playbook_run.log on the controller.
+      #
+      # no_log hides the command. failed_when: false plus the task below keeps
+      # the DIAGNOSIS: the script's catch block writes "FAILED: <message>" to
+      # stdout, and that is what actually tells you what went wrong. Same shape
+      # as elastic_agent, which checks the outcome separately rather than
+      # trusting an exit code.
+      no_log: true
+      failed_when: false
+
+    # Surfaces stdout ONLY -- never the command. stdout carries the catch
+    # block's "FAILED: <exception>"; the command is what carries the secret.
+    - name: Fail if simspace could not be created in the child domain
+      ansible.builtin.fail:
+        msg: |
+          Creating {{ bootstrap_child_domain }}\simspace failed.
+
+          {{ bootstrap_simspace.stdout | default('(no output)') | trim }}
+
+          The credential is not shown. If you need the exact command, read the
+          play -- do not remove no_log from the task above.
+      when: (bootstrap_simspace.rc | default(1)) != 0
+
+    - name: Show bootstrap result
+      ansible.builtin.debug:
+        msg: "bootstrap_simspace ({{ bootstrap_child_domain }}\\simspace) -> {{ bootstrap_simspace.stdout | trim }}"
+      when: bootstrap_simspace.stdout is defined
+  tags:
+    - dcpromo
+    - bootstrap_child_simspace
+
+- name: Create Users
+  hosts: pdc
+  gather_facts: false
+  roles:
+    - create_users
+  tags:
+    - create_users
+
+# A freshly promoted child DC answers ADWS (gated above) minutes before its
+# DomainDnsZones application partition is enlisted. The `dns` role's zone task
+# runs `replication: domain`, which re-scopes the zone Install-ADDSDomain has
+# already created -- and that call fails until the partition exists:
+#
+#   "Failed to set properties on the zone fops.blackstone.mil: Failed to reset
+#    the directory partition for zone fops.blackstone.mil on server FOPS-DC01."
+#
+# Measured on a cold range 2026-09-18: failed 48 minutes into the run, then
+# passed UNCHANGED on the next two attempts. The cost was not one red line --
+# a failed task ends the play for that host, so fops-dc01 also dropped out of
+# every play below this one. It got no internal DNS records, never enrolled in
+# Fleet, and the deploy failed 4h later at the Fleet coverage gate.
+#
+# The ADWS gate above does not cover this. ADWS is a different subsystem: it
+# answers while the DNS application partition is still being enlisted. Gate on
+# what the next step actually needs.
+- name: dns
+  hosts: pdc
+  gather_facts: false
+  vars:
+    # 20 x 15s = 5 minutes, then REPAIR. Waiting was tried at 10 minutes and
+    # again at 40, and neither worked, because the partition is not late -- it
+    # is absent. On 2026-09-20 fops-dc01 reported, after the full 2400s:
+    #
+    #   DNSPART_NOT_READY zone ds=True scope=Legacy | partition-query-failed:
+    #   Failed to get Directory Partition information for
+    #   DomainDnsZones.fops.blackstone.mil on server FOPS-DC01.
+    #
+    # "Failed to get Directory Partition information" is the partition being
+    # ABSENT, not merely un-enlisted on this server. No ceiling fixes that. The
+    # short probe stays because the forest root answers it on the first try and
+    # a genuinely slow partition would land inside five minutes; past that, the
+    # tasks below create it.
+    dns_partition_retries: 20
+    dns_partition_repair_retries: 20
+  pre_tasks:
+    # Probe the partition rather than the zone: this is the precondition the
+    # zone re-scope depends on, and it is readable without a credential.
+    - name: Preflight — the DomainDnsZones partition is enlisted
+      ansible.windows.win_shell: |
+        $dom = "{{ domain_name }}"
+        $ready = $false
+        $detail = ""
+        # Signal 1, and the one that matters: the zone is already AD-integrated
+        # at Domain scope. When this holds, `win_dns_zone` has nothing to change
+        # and cannot fail -- so it predicts what the next task will do, exactly.
+        try {
+          $z = Get-DnsServerZone -Name $dom -ErrorAction Stop
+          $detail = "zone ds=$($z.IsDsIntegrated) scope=$($z.ReplicationScope)"
+          if ($z.IsDsIntegrated -and "$($z.ReplicationScope)" -match 'Domain') { $ready = $true }
+        } catch {
+          $detail = "zone-query-failed: $($_.Exception.Message)"
+        }
+        # Signal 2, for a zone that genuinely has to be created rather than
+        # re-scoped: the partition exists and is healthy (State 0 = DNS_DP_OKAY).
+        # Two independent signals on purpose -- this gate is fail-closed, and a
+        # single property name that turns out to read differently on some image
+        # would otherwise stall a healthy range for ten minutes and then fail it.
+        if (-not $ready) {
+          try {
+            $p = Get-DnsServerDirectoryPartition -Name "DomainDnsZones.$dom" -ErrorAction Stop
+            $detail += " | partition state=$($p.State) flags=$($p.Flags)"
+            if ($p.State -eq 0) { $ready = $true }
+          } catch {
+            $detail += " | partition-query-failed: $($_.Exception.Message)"
+          }
+        }
+        if ($ready) { "DNSPART_READY $detail" } else { "DNSPART_NOT_READY $detail" }
+      register: dns_partition
+      until: "'DNSPART_READY' in (dns_partition.stdout | default(''))"
+      retries: "{{ dns_partition_retries }}"
+      delay: 15
+      changed_when: false
+      failed_when: false
+
+    # The built-in DNS application partitions are supposed to be created during
+    # promotion. When they are not -- observed on every cold airfield build for
+    # the child domain -- the documented remedy is to create them explicitly.
+    # This is `dnscmd`, not a PowerShell cmdlet, because there is no cmdlet for
+    # the BUILT-IN partitions: Add-DnsServerDirectoryPartition makes custom
+    # ones. Requires Enterprise Admins, which the connection already holds.
+    #
+    # failed_when: false because the re-probe below is what decides. dnscmd
+    # returns non-zero for "already exists" as well as for real failures, and
+    # treating those the same would fail a host that is fine.
+    - name: Create the built-in DNS application partitions
+      ansible.windows.win_shell: |
+        $out = & dnscmd /CreateBuiltinDirectoryPartitions /Domain 2>&1 | Out-String
+        Write-Output $out.Trim()
+      register: dns_partition_create
+      when: "'DNSPART_READY' not in (dns_partition.stdout | default(''))"
+      changed_when: "'DNSPART_READY' not in (dns_partition.stdout | default(''))"
+      failed_when: false
+
+    # The DNS Server service enumerates its directory partitions at startup, so
+    # a partition created underneath a running service is not picked up until
+    # it restarts.
+    - name: Restart the DNS Server service so it sees the new partition
+      ansible.windows.win_service:
+        name: DNS
+        state: restarted
+      when: "'DNSPART_READY' not in (dns_partition.stdout | default(''))"
+      failed_when: false
+
+    - name: Preflight — re-check the partition after creating it
+      ansible.windows.win_shell: |
+        $dom = "{{ domain_name }}"
+        $ready = $false
+        $detail = ""
+        try {
+          $z = Get-DnsServerZone -Name $dom -ErrorAction Stop
+          $detail = "zone ds=$($z.IsDsIntegrated) scope=$($z.ReplicationScope)"
+          if ($z.IsDsIntegrated -and "$($z.ReplicationScope)" -match 'Domain') { $ready = $true }
+        } catch {
+          $detail = "zone-query-failed: $($_.Exception.Message)"
+        }
+        if (-not $ready) {
+          try {
+            $p = Get-DnsServerDirectoryPartition -Name "DomainDnsZones.$dom" -ErrorAction Stop
+            $detail += " | partition state=$($p.State) flags=$($p.Flags)"
+            if ($p.State -eq 0) { $ready = $true }
+          } catch {
+            $detail += " | partition-query-failed: $($_.Exception.Message)"
+          }
+        }
+        if ($ready) { "DNSPART_READY $detail" } else { "DNSPART_NOT_READY $detail" }
+      register: dns_partition_after
+      until: "'DNSPART_READY' in (dns_partition_after.stdout | default(''))"
+      retries: "{{ dns_partition_repair_retries }}"
+      delay: 15
+      changed_when: false
+      failed_when: false
+      when: "'DNSPART_READY' not in (dns_partition.stdout | default(''))"
+
+    # Fail HERE with the reason rather than inside the zone loop, where the
+    # message names a DNS API call and not the thing that is actually missing.
+    - name: Fail if the DomainDnsZones partition never enlisted
+      ansible.builtin.fail:
+        msg: |
+          {{ inventory_hostname }} has no usable DNS application partition for
+          {{ domain_name }}, and creating it did not work.
+
+          Before repair : {{ dns_partition.stdout | default('(no output)') | trim }}
+          dnscmd said   : {{ dns_partition_create.stdout | default('(did not run)') | trim }}
+          After repair  : {{ dns_partition_after.stdout | default('(did not run)') | trim }}
+
+          The run already waited {{ (dns_partition_retries | int) * 15 }}s, ran
+          `dnscmd /CreateBuiltinDirectoryPartitions /Domain`, restarted the DNS
+          Server service and waited a further
+          {{ (dns_partition_repair_retries | int) * 15 }}s. Waiting longer will
+          not help -- that was tried at 600s and at 2400s and the partition is
+          absent, not late.
+
+          Check, in order:
+            1. whether the credential has Enterprise Admins. Creating the
+               built-in partitions requires it, and dnscmd reports the refusal
+               in its output above.
+            2. repadmin /showrepl  -- a child DC that has not completed its
+               first inbound replication has no application partitions yet.
+            3. Get-DnsServerDirectoryPartition with no -Name, to see what this
+               server does have.
+      when:
+        - "'DNSPART_READY' not in (dns_partition.stdout | default(''))"
+        - "'DNSPART_READY' not in (dns_partition_after.stdout | default(''))"
+  roles:
+    - dns
+  tags:
+    - dns
+
+# The customer's `dns` role creates AD zones and records but doesn't touch
+# DNS forwarders, so anything outside blackstone.mil / fops.blackstone.mil is unresolvable
+# on the domain workstations. Point both DCs at is-inet's simulated public DNS
+# (unbound binds the 8.8.8.8 / 8.8.4.4 / 1.1.1.1 aliases on is-inet — see
+# PowerPlant ss-pp-ab/UPSTREAM_FIXES.md 2026-05-22 entry).
+- name: Configure DNS forwarders to is-inet
+  hosts: domain_controllers
+  gather_facts: false
+  tasks:
+    - name: Point Windows DNS forwarder at is-inet
+      ansible.windows.win_powershell:
+        script: |
+          $current = @((Get-DnsServerForwarder).IPAddress.IPAddressToString | Sort-Object)
+          $desired = @('8.8.8.8', '8.8.4.4', '1.1.1.1') | Sort-Object
+          if (-not (Compare-Object $current $desired -SyncWindow 0)) {
+            $Ansible.Changed = $false
+            Write-Output "DNS forwarder already set to: $($desired -join ', ')"
+          } else {
+            Set-DnsServerForwarder -IPAddress $desired -UseRootHint $false -Timeout 3
+            $Ansible.Changed = $true
+            Write-Output "DNS forwarder updated to: $($desired -join ', ')"
+          }
+  tags:
+    - dns
+    - dns_forwarder
+
+# =============================================================================
+# Domain controllers must ADVERTISE themselves before anything tries to join.
+#
+# Nothing in this playbook did that until 2026-09-20. Every member join ran on
+# the assumption that the DCs had registered their locator SRV records, and on
+# a fresh build that assumption is sometimes false. The cost was two fops
+# members per build failing all three join passes with
+#
+#   DCLOCATOR_NOT_READY no-srv-records-for-fops.blackstone.mil
+#   dns=[Ethernet1=172.31.3.11/172.31.3.12] ip=[172.31.5.82,10.255.240.144]
+#
+# -- a host whose resolvers and addresses were both CORRECT. The members were
+# fine. The records they were looking for did not exist yet. Re-applying member
+# network config, which is what the join role now does on passes 2 and 3, could
+# never have fixed that, and did not.
+#
+# `nltest /dsregdns` forces the DC to re-register its locator records
+# immediately rather than waiting for the Netlogon timer. Then we prove they
+# resolve, because forcing registration and having it succeed are different
+# claims.
+#
+# Placed after the DNS forwarders play and before the joins: the DCs are
+# serving by now, and the members have not started looking yet.
+# =============================================================================
+- name: Domain controllers — register and prove their locator records
+  hosts: pdc
+  gather_facts: false
+  vars:
+    dc_srv_retries: 40          # 40 x 15s = 10 minutes
+  tasks:
+    - name: Force this DC to register its locator records
+      ansible.windows.win_shell: |
+        $out = & nltest /dsregdns 2>&1 | Out-String
+        Write-Output $out.Trim()
+      register: dc_dsregdns
+      changed_when: false
+      failed_when: false
+
+    # Prove the records RESOLVE, not merely that registration was requested.
+    # A gate has to test what the step behind it needs, and what the join
+    # plays need is an answer from DNS.
+    - name: Prove this domain advertises a domain controller
+      ansible.windows.win_shell: |
+        $r = @(Resolve-DnsName -Type SRV -Name "_ldap._tcp.dc._msdcs.{{ domain_name }}" -ErrorAction SilentlyContinue |
+               Where-Object { $_.QueryType -eq 'SRV' -and $_.NameTarget })
+        if ($r.Count -gt 0) {
+          "DCSRV_READY " + (($r | ForEach-Object { $_.NameTarget }) -join ',')
+        } else {
+          "DCSRV_NOT_READY"
+        }
+      register: dc_srv
+      until: "'DCSRV_READY' in (dc_srv.stdout | default(''))"
+      retries: "{{ dc_srv_retries }}"
+      delay: 15
+      changed_when: false
+      failed_when: false
+
+    - name: Report the locator records this domain advertises
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} ({{ domain_name }}): {{ dc_srv.stdout | default('(no output)') | trim }}"
+
+    # Fail HERE rather than letting 15 members each spend three join passes
+    # discovering the same thing one at a time.
+    - name: Fail if this domain advertises no domain controller
+      ansible.builtin.fail:
+        msg: |
+          {{ domain_name }} has no _ldap._tcp.dc._msdcs SRV records after
+          {{ (dc_srv_retries | int) * 15 }}s, with registration forced.
+
+          nltest said: {{ dc_dsregdns.stdout | default('(no output)') | trim }}
+
+          Every member of this domain will fail to join, and each will spend
+          three passes finding that out. Check, in order:
+            1. Get-Service Netlogon   (registration is its job)
+            2. that the zone {{ domain_name }} exists and is writable on this
+               DC -- a Legacy-scoped or read-only zone accepts no dynamic
+               registration
+            3. Get-DnsServerZone -Name {{ domain_name }} | Select-Object
+               ZoneName, IsDsIntegrated, DynamicUpdate
+      when: "'DCSRV_READY' not in (dc_srv.stdout | default(''))"
+  tags:
+    - dns
+    - dc_srv_records
+
+# Pre-emptively strip 169.254.x.x APIPA addresses Windows assigns when the
+# DHCP→static handoff lags (most common on .3 host in every subnet during
+# PowerPlant). If APIPA stays, domain join fails with "The specified domain
+# either does not exist or could not be contacted."
+- name: Strip APIPA
+  hosts: windows
+  gather_facts: false
+  strategy: free                # per-host reg + netsh; no cross-host sync
+  roles:
+    - strip_apipa
+  tags:
+    - strip_apipa
+
+# Two Join Domain plays — one per forest. Each member host inherits its own
+# `domain_name` from the blackstone/fops group_vars (members_blackstone hosts are
+# also in [blackstone] via the blackstone_workstations / blackstone_services / blackstone_engineering
+# / blackstone_soc subgroups; members_fops hosts similarly under [fops]).
+- name: Join Domain — blackstone.mil
+  hosts: members_blackstone
+  gather_facts: false
+  # `strategy: free` is available here but NOT enabled. The blocker is gone --
+  # domain_member_retry settles with a `wait_for` delegated to localhost, not
+  # `ansible.builtin.pause`, which bypasses the host loop and crashes every
+  # deploy.sh attempt under the free strategy (PowerPlant, 2026-07-03).
+  #
+  # Left on `linear` deliberately: all 29 members join against a single DC
+  # (bs-dc02 is promoted below this play), and 2026-09-18 showed that herd
+  # already costing joins. Freeing the strategy raises the concurrency this
+  # play was failing at. Revisit once the locator preflight has a clean cold
+  # run behind it.
+  roles:
+    - domain_member_retry
+  tags:
+    - domain_member_retry
+    - join_blackstone
+
+- name: Join Domain — fops.blackstone.mil
+  hosts: members_fops
+  gather_facts: false
+  # Same as above: `free` is available, and left off for the same reason.
+  roles:
+    - domain_member_retry
+  tags:
+    - domain_member_retry
+    - join_fops
+
+# Promotes bs-dc02 into blackstone.mil and fops-dc02 into fops.blackstone.mil. The
+# additional_dc role joins each VM as a workstation first (using its
+# domain_name from group_vars), then runs Install-ADDSDomainController.
+- name: Additional DC
+  hosts: additional_dc
+  gather_facts: false
+  roles:
+    - additional_dc
+  tags:
+    - additional_dc
+
+- name: dc_status
+  hosts: domain_controllers
+  gather_facts: false
+  roles:
+    - dc_status
+  tags:
+    - dc_status
+
+# The customer's common/tasks/windows.yml "Disable control net DNS
+# registration" task is a double-no-op (typo `Ehternet0` + misspelled
+# `RegisterThisConnectionAddress` cmdlet param). Net result: every Windows
+# host DDNS-registers BOTH Ethernet0 (mgmt 10.255.240.0/20) AND the
+# data-plane adapter, so name resolution round-robins onto the mgmt IP
+# (which is supposed to be out of play in-scenario).
+#
+# Disable DDNS on Ethernet0 on every Windows host and force a re-register
+# so the data-plane record stays. The next play purges any 10.255.240.0/20
+# records already in AD DNS. Logged in UPSTREAM_FIXES.md.
+- name: Strip mgmt interface from AD DNS registration
+  hosts: windows
+  gather_facts: false
+  tasks:
+    - name: Disable DDNS on Ethernet0 (mgmt adapter)
+      ansible.windows.win_powershell:
+        script: |
+          $iface = 'Ethernet0'
+          $c = Get-DnsClient -InterfaceAlias $iface -ErrorAction SilentlyContinue
+          if ($null -eq $c) {
+            $Ansible.Changed = $false
+            Write-Output "No $iface adapter present; nothing to do."
+            return
+          }
+          if ($c.RegisterThisConnectionsAddress) {
+            Set-DnsClient -InterfaceAlias $iface -RegisterThisConnectionsAddress $false
+            ipconfig /registerdns | Out-Null
+            $Ansible.Changed = $true
+            Write-Output "Disabled DDNS on $iface; re-registered."
+          } else {
+            $Ansible.Changed = $false
+            Write-Output "DDNS already disabled on $iface."
+          }
+  tags:
+    - strip_mgmt_dns
+
+# Scrub any 10.255.240.0/20 A records that already snuck into AD DNS before
+# the strip_mgmt_dns play landed. Runs against both PDCs — each one targets
+# its own forest's zone (`blackstone.mil` on bs-dc01, `fops.blackstone.mil` on fops-dc01)
+# via the per-host `domain_name`. PTR records in 240.255.10.in-addr.arpa are
+# scoped to whatever reverse zones the dns role created — we don't expect
+# any to be present yet, but log_only here to be safe.
+- name: Purge mgmt-subnet A records from AD DNS
+  hosts: pdc
+  gather_facts: false
+  tasks:
+    - name: Remove A records in {{ domain_name }} whose IPv4 falls in 10.255.240.0/20
+      ansible.windows.win_powershell:
+        script: |
+          $zone = '{{ domain_name }}'
+          # 10.255.240.0/20 = 10.255.240.0 .. 10.255.255.255 (third octet 240..255)
+          $stale = Get-DnsServerResourceRecord -ZoneName $zone -RRType A -ErrorAction SilentlyContinue |
+            Where-Object {
+              $ip = $_.RecordData.IPv4Address.ToString()
+              if ($ip -notlike '10.255.*') { return $false }
+              $third = [int]($ip.Split('.')[2])
+              ($third -ge 240) -and ($third -le 255)
+            }
+          foreach ($r in $stale) {
+            Remove-DnsServerResourceRecord -ZoneName $zone -InputObject $r -Force -ErrorAction Stop
+          }
+          if ($stale.Count -eq 0) {
+            $Ansible.Changed = $false
+            Write-Output "No stale 10.255.240.0/20 A records in $zone."
+          } else {
+            $Ansible.Changed = $true
+            Write-Output "Removed $($stale.Count) stale A record(s) in $zone."
+          }
+  tags:
+    - purge_mgmt_dns
+
+# =============================================================================
+# File services tier — fileserver + mapped drive (per domain)
+# =============================================================================
+# Mapped Drive depends on File Share existing first. Two Mapped Drive plays
+# (one per forest) so each domain's letter/path stays explicit in the playbook
+# even though the customer role reads per-host vars from group_vars.
+
+- name: File Share
+  hosts: fileservers
+  gather_facts: false
+  roles:
+    - fileserver
+  tags:
+    - file_share
+
+# mapped_drive uses win_dsc with the GroupPolicy DSC resource — must run on
+# a DC, which has RSAT-GPMC + the GroupPolicy DSC module installed.
+# GP replication propagates the GPO to every member at next login.
+# (Previously targeted `members_*` directly, which failed on every member
+#  with "Resource 'GroupPolicy' not found" / "Get-GPO not recognized".)
+- name: Mapped Drive — blackstone.mil
+  hosts: pdc_blackstone
+  gather_facts: false
+  roles:
+    - mapped_drive
+  tags:
+    - mapped_drive
+    - mapped_drive_blackstone
+
+- name: Mapped Drive — fops.blackstone.mil
+  hosts: pdc_fops
+  gather_facts: false
+  # Fatal, like the blackstone play above it, because the role works here.
+  #
+  # This play wrapped the role in block/rescue for two months so a failing GPO
+  # link would not stop the deploy. What it actually did was hide the failure:
+  # the link never got made, the run reported success, and nobody knew the
+  # mapped drive did not exist. The role now pins -Domain and -Server to this
+  # DC so New-GPLink never calls the DC locator -- which is where HRESULT
+  # 0x8007054B came from -- and links cleanly and idempotently on both DCs.
+  #
+  # If this ever fails again it should stop the deploy and say so.
+  roles:
+    - mapped_drive
+  tags:
+    - mapped_drive
+    - mapped_drive_fops
+
+# =============================================================================
+# Windows-side polish (matches PowerPlant pattern, doubled for two forests)
+# =============================================================================
+
+- name: ae_gpo
+  hosts: pdc
+  gather_facts: false
+  roles:
+    - ae_gpo
+  tags:
+    - ae_gpo
+
+# Suppress the Win10/11 "Set network location (Public/Private)" popup that
+# blocks AUE simulation, reclassify any Public profiles as Private, and
+# enable Network Discovery + File & Printer Sharing firewall rule groups.
+- name: Enable network discovery and suppress the Public/Private popup
+  hosts: windows
+  gather_facts: false
+  strategy: free                # per-host firewall + registry, no cross-host sync
+  roles:
+    - network_discovery
+  tags:
+    - network_discovery
+
+# =============================================================================
+# Public web landing page — bs-www serves www.blackstone.mil
+# =============================================================================
+# External simulated clients resolve www.blackstone.mil to bs-edge-fw's
+# WAN interface (199.252.163.1); pfSense NAT rule DNATs :80/:443 to
+# bs-www (172.31.12.3) where nginx serves the themed landing page from
+# /var/www/blackstone/. Static content for now, ready for CMS-style
+# extensions later.
+- name: Blackstone public web landing — bs-www
+  hosts: bs-www
+  gather_facts: false
+  become: true
+  roles:
+    - blackstone_www
+  tags:
+    - blackstone_www
+    - public_web
+
+# =============================================================================
+# Enterprise services — root cert trust, AUE/AE workstation posture, hunt tools
+# =============================================================================
+# The `root_certs` role installs the SimSpace lab-CA + scenario TLS certs
+# into every Windows host's Trusted Root store so browsers don't error when
+# hitting is-inet-simulated HTTPS sites (outlook.com, faa.gov, etc.). Runs
+# BEFORE the AUE/AE plays because Chrome + browsing simulation depend on it.
+- name: Install root certs — Windows Trusted Root store
+  hosts: windows
+  gather_facts: false
+  strategy: free                # per-host cert store install, no cross-host sync
+  roles:
+    - root_certs
+  tags:
+    - root_certs
+
+# AUE (Attack User Experience) — locks down Windows workstations for user
+# simulation. `[aue]` group is the RDP-facing workstations (bs-hq*, bs-it*,
+# bs-supply*, bs-eng*, soc-analyst*, fops-flight*, fops-ops*). Roles:
+#   disable_uac / disable_firewall  — remove interactive prompts blocking sim
+#   autologin                       — HKLM\Winlogon\Default* per host_vars
+#   ue                              — user-experience baseline (start menu, etc.)
+#   chrome                          — browser install + defaults
+#   sysmon (already applied earlier via its own play — no-op idempotent)
+#   aue_agent                       — Attack User Experience agent + drainhole
+#   secpol                          — local security policy tweaks
+#   drainhole                       — traffic shaping harness
+- name: apply AUE settings
+  hosts: aue
+  gather_facts: false
+  strategy: free                # each workstation reboots for chrome+sysmon
+                                # independently -- biggest wall-clock win here
+  roles:
+    - disable_uac
+    - disable_firewall
+    - autologin
+    - ue
+    - chrome
+    - aue_agent
+    - secpol
+    - drainhole
+  tags:
+    - aue
+    - disable_uac
+    - disable_firewall
+
+# AE (Attack Emulation) — high-value AD targets (DCs, file servers, WEC).
+# Subset of AUE: no autologin/ue/chrome (these are servers, not workstation
+# sim targets), but same tooling agents so red-team scenarios can pivot.
+- name: apply AE settings
+  hosts: ae
+  gather_facts: false
+  strategy: free                # per-host agent + policy config, no cross-host sync
+  roles:
+    - disable_uac
+    - disable_firewall
+    - secpol
+    - aue_agent
+    - drainhole
+  tags:
+    - ae
+    - disable_uac
+    - disable_firewall
+    - secpol
+
+# Hunt tier — forensic / analyst tooling on non-domain-joined workstations.
+# The [hunt] group is a mix of OSes (soc-flare = FLARE-VM/Windows, soc-sift
+# and soc-openvas = Ubuntu). The chrome + autologin roles are Windows-only,
+# so intersect with [windows] via `hunt:&windows` so Ansible skips the
+# Ubuntu hunt hosts cleanly. soc-flare has to be explicitly listed in the
+# [windows] group in `hosts` for it to be picked up here -- and FLARE-VM
+# has to have WinRM enabled inside the image itself before this play can
+# actually reach it (typically: `Enable-PSRemoting -Force` from a local
+# admin session on the FLARE-VM console the first time).
+- name: configure hunt
+  hosts: hunt:&windows
+  gather_facts: false
+  roles:
+    - chrome
+    - autologin
+  tags:
+    - hunt
+    - chrome
+    - autologin
+
+# =============================================================================
+# Infrastructure services — internet-simulator DNS + enterprise squid proxy
+# =============================================================================
+# is_inet_fix must run BEFORE global_dns. The RC-IS-INET image ships eth1
+# as /32 with no default gateway (unusable for corp -> is-inet reachability)
+# AND the container's entrypoint doesn't launch unbound. See airfield-range
+# UPSTREAM_FIXES.md 2026-07-08 entry. Without is_inet_fix, the global_dns
+# `reload unbound` handler silently fails (`ignore_errors: yes` masks it)
+# and corp DNS queries to 8.8.8.8/8.8.4.4/1.1.1.1 time out.
+- name: is_inet_fix — eth1 netmask + gateway + unbound supervisor
+  hosts: is-inet
+  gather_facts: true
+  become: true
+  roles:
+    - is_inet_fix
+  tags:
+    - is_inet_fix
+    - is_inet
+
+# global_dns writes /opt/simspace_includes/simspace_includes.conf inside
+# is-inet's unbound container from `global_dns_records` (group_vars/all.yml)
+# so scenario names (faa.gov, weather.gov, arbitrsecurity.com, etc.) resolve
+# to lab-simulated public IPs. Template also emits `local-zone: transparent`
+# for every zone we serve, defeating the corpora files' `redirect` zones
+# that would otherwise abort unbound at startup. Reload triggered via the
+# `reload unbound` handler (roles/handlers/handlers/main.yml).
+- name: global_dns — populate is-inet's unbound zone
+  hosts: global_dns
+  gather_facts: true
+  become: true
+  roles:
+    - global_dns
+  tags:
+    - global_dns
+    - dns
+
+# is-inet Postfix + Dovecot + webmail. Multi-domain: driven by
+# `email_domains` in group_vars/all.yml (blackstone.mil, fops.blackstone.mil,
+# outlook.com). Mailboxes seeded per-domain from that domain's `DomainUsers`
+# list — is-inet is a direct member of [blackstone] so it sees
+# blackstone.yml's users. Certs signed by the range root CA bundled in the
+# role's files/. Runs AFTER global_dns so domain names resolve before
+# Postfix's smtpd_helo checks fire against the domain's own MX record on
+# startup.
+- name: email — is-inet Postfix + Dovecot + webmail
+  hosts: email
+  gather_facts: true
+  become: true
+  roles:
+    - email
+  tags:
+    - email
+    - is-inet
+
+# Enterprise-internal HTTP/HTTPS proxy. bs-proxy runs the customer `squid`
+# role (Ubuntu Desktop 22.04, 172.31.2.15:3128, Services subnet). Downstream
+# hosts that want an in-scenario proxy point at proxy.blackstone.mil:3128. Not
+# used for Ansible/apt egress -- that stays on the mgmt-plane
+# inet_proxy_addr (10.255.240.1:3128) per CLAUDE.md §8.
+- name: squid — enterprise HTTP/HTTPS proxy on bs-proxy
+  hosts: proxy
+  gather_facts: true
+  become: true
+  roles:
+    - squid
+  tags:
+    - squid
+    - proxy
+
+# =============================================================================
+# SOC tier — syslog backbone
+# =============================================================================
+# Central rsyslog collector on soc-syslog (172.31.7.13), receives over UDP+TCP
+# 514, writes per-host files at /var/log/remote/<hostname>/syslog.log. Linux
+# hosts and VyOS routers forward into it. pfSense + Wazuh + SIEM ingest come
+# in the next batch.
+
+
+# Squid's ACCESS log now goes to the Elastic agent, not to files or syslog.
+# The squid integration's input is `udp` (the package manifest says
+# squid.log carries input=udp, not logfile), so squid has to SEND rather than
+# the agent tailing a file. Squid supports a udp:// destination natively, so
+# this goes straight to the agent on loopback.
+#
+# The two log lines this replaces, both from roles/squid/files/squid.conf:
+#   access_log /var/log/squid/access.log splunk_json_squid
+#       Splunk-specific JSON. Splunk was removed from this range 2026-09-15;
+#       nothing consumes it.
+#   access_log syslog:local2 combined
+#       Went to the host's own /var/log/syslog, where the system integration
+#       picks it up and ships it to SO as UNPARSED message text. Removing it
+#       deletes that duplicate at source; the parsed copy in
+#       logs-squid.log-* replaces it with real fields.
+#
+# Squid's own system messages still reach soc-syslog via the host's `*.*`
+# rsyslog forward. Only the ACCESS log stops going there.
+#
+# A play, not a role edit: squid is a customer base role and workarounds are
+# plays (CLAUDE.md role-sourcing policy).
+- name: Squid — send access log to the Elastic agent instead of files/syslog
+  hosts: proxy
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Remove the Splunk-format access_log line
+      ansible.builtin.lineinfile:
+        path: /etc/squid/squid.conf
+        regexp: '^access_log\s+/var/log/squid/access\.log\s+splunk_json_squid'
+        state: absent
+      register: squid_rm_splunk
+
+    - name: Remove the syslog access_log line (duplicate into system.syslog)
+      ansible.builtin.lineinfile:
+        path: /etc/squid/squid.conf
+        regexp: '^access_log\s+syslog:local2'
+        state: absent
+      register: squid_rm_syslog
+
+    - name: Send the access log to the Elastic agent over loopback UDP
+      ansible.builtin.lineinfile:
+        path: /etc/squid/squid.conf
+        regexp: '^access_log\s+udp://'
+        line: "access_log udp://127.0.0.1:9537 squid"
+        insertafter: '^#?\s*access_log'
+        state: present
+      register: squid_add_udp
+
+    # Reload, not restart: squid re-reads config without dropping in-flight
+    # client connections, and the range has live user emulation against it.
+    - name: Reload squid if the log destinations changed
+      ansible.builtin.command: squid -k reconfigure
+      when: squid_rm_splunk.changed or squid_rm_syslog.changed or squid_add_udp.changed
+      changed_when: true
+
+    # Positive proof the line is actually in force, not merely in the file.
+    - name: Confirm squid is running with the udp destination
+      ansible.builtin.command: grep -c "^access_log udp://127.0.0.1:9537 squid" /etc/squid/squid.conf
+      register: squid_udp_check
+      changed_when: false
+      failed_when: squid_udp_check.rc != 0
+  tags:
+    - squid
+    - squid_logging
+
+- name: Syslog collector — soc-syslog
+  hosts: soc-syslog
+  gather_facts: false
+  become: true
+  roles:
+    - syslog_server
+  tags:
+    - syslog
+    - syslog_server
+
+- name: Syslog client — Linux
+  hosts: linux:!syslog
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Drop rsyslog forwarder snippet
+      ansible.builtin.copy:
+        dest: /etc/rsyslog.d/00-forward.conf
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          # Forward all logs to soc-syslog (the central rsyslog collector).
+          # Managed by Ansible (site.yml). UDP — accepted on both UDP+TCP by
+          # the server; UDP avoids the queue-up failure mode if soc-syslog
+          # is briefly unreachable.
+          *.* @{{ syslog_server_ip }}:514
+      register: rsyslog_forward
+
+    - name: Restart rsyslog if forwarder snippet changed
+      ansible.builtin.systemd:
+        name: rsyslog
+        state: restarted
+      when: rsyslog_forward.changed
+  tags:
+    - syslog
+    - syslog_client
+
+# VyOS client config: push the syslog remote-host line.
+# `set system syslog host` is idempotent under vyos_config; level "info"
+# matches what the GUI default sets.
+- name: Syslog client — VyOS
+  hosts: vyos
+  gather_facts: false
+  tasks:
+    - name: Configure remote syslog host
+      vyos.vyos.vyos_config:
+        match: line
+        lines:
+          - "set system syslog host {{ syslog_server_ip }} facility all level info"
+        save: true
+  tags:
+    - syslog
+    - syslog_client
+
+
+# Sysmon (Microsoft Sysinternals) — endpoint telemetry beyond what Windows
+# Event Log ships by default. Once installed, events land in
+# Microsoft-Windows-Sysmon/Operational, which the Elastic Agent enrolled by
+# playbooks/75-endpoint.yml ships into Security Onion.
+#
+# Role copied from PowerPlant/range-development-ansible/roles/sysmon.
+# Config: templates/sysmon-config.xml.j2 (1200-line rules file inherited
+# from PowerPlant; a comprehensive detection baseline). Installer URL:
+# `sysmon_installer` (group_vars/windows.yml) — nexus-staged sysmon64.exe.
+# The role is idempotent via `creates_service: Sysmon64` on win_package,
+# so re-runs against already-Sysmon'd hosts are no-ops. To force a config
+# refresh later, uninstall via `sysmon64.exe -u` then re-run this play.
+#
+# Sysmon must be installed and writing before 75-endpoint enrols the agent
+# that reads the channel. Scoped runs:
+#   --tags sysmon --limit bs-hq01     # single-host pilot
+#   --tags sysmon                      # full Windows fleet
+- name: Sysmon — Windows endpoint telemetry
+  hosts: windows
+  gather_facts: true
+  strategy: free                # per-host Sysmon64 install, no cross-host sync
+  roles:
+    - sysmon
+  tags:
+    - sysmon
+    - endpoint
+
+# =============================================================================
+# Management plane carries NO AD traffic — enforced, not assumed
+# =============================================================================
+# REQUIREMENT (Eric, 2026-08-17): no range-generated AD/LDAP traffic may cross
+# 10.255.240.0/20. CLAUDE.md §8 already says the management plane is
+# out-of-band and invisible in-scenario; this play makes that enforceable.
+#
+# WHY A SECOND PASS. "Strip mgmt interface from AD DNS registration" and
+# "Purge mgmt-subnet A records" both run much earlier, right after dc_status --
+# and roughly thirty plays follow them, several of which reboot a DC. A DC
+# re-registers its DNS records on every Netlogon start, so a purge in the
+# middle of the run proves nothing about the state at the end of it.
+#
+# MEASURED ON A DEPLOYED RANGE 2026-08-13, with both earlier plays having run:
+#
+#   Get-DnsServerResourceRecord -ZoneName blackstone.mil -RRType A
+#     bs-dc01  10.255.240.136
+#     bs-dc02  10.255.240.178
+#
+#   Resolve-DnsName bs-dc01.blackstone.mil -Type A
+#     172.31.2.7        <- production
+#     10.255.240.136    <- management
+#
+# Clients round-robin across both, so roughly HALF of all Kerberos, LDAP and
+# RPC traffic was crossing the management plane -- visible to trainees hunting
+# in Security Onion as 10.255.240.x in authentication flows, which is
+# out-of-scenario infrastructure they should not know exists. The SO dashboard
+# is what surfaced it: destination.ip showed the four DC management addresses
+# with counts comparable to their production ones.
+#
+# NOT fixing this with Netlogon's DnsAvoidRegisterRecords. The domain-level
+# "same as parent" records are already clean here -- blackstone.mil resolves to
+# production addresses only -- so that control addresses a problem this range
+# does not have, and a wrong mnemonic would break DC locator. Purge what is
+# demonstrably wrong, then assert it stayed gone.
+# =============================================================================
+# Distributed Splunk
+# =============================================================================
+# The second SIEM. Security Onion is installed by the phase playbooks imported
+# at the bottom of this file; Splunk is built here, and the same endpoints feed
+# both -- an Elastic Agent into SO's Fleet, a universal forwarder into this
+# cluster. Neither is a fallback for the other.
+#
+# PLACED AFTER the syslog and Sysmon plays on purpose. The forwarder play below
+# configures inputs that read /var/log/remote/* on soc-syslog and the
+# Microsoft-Windows-Sysmon/Operational channel on every Windows host. Building
+# it before those exist produces a forwarder that is running, connected and
+# reading nothing -- which every "is the service up" check calls a pass.
+- name: Splunk cluster manager
+  hosts: splunk_cluster_manager
+  gather_facts: true
+  become: true
+  roles:
+    - splunk
+    - splunk_cluster_manager
+  tags:
+    - splunk_cluster
+    - splunk_cm
+
+# MUST FOLLOW THE CLUSTER MANAGER. A peer that joins before the manager answers
+# is configured but never registers, and the manager simply does not list it --
+# no error on either side.
+- name: Splunk indexer peers
+  hosts: splunk_indexer
+  gather_facts: true
+  become: true
+  roles:
+    - splunk
+    - splunk_indexer
+    # Central licensing: soc-splunk-cm is the only license holder and every
+    # other node is a peer pointed at it. Shares the play's tags deliberately --
+    # the base `splunk` role re-adds a license and rewrites server.conf, so this
+    # must never be runnable without it.
+    - splunk_license_peer
+  tags:
+    - splunk_cluster
+    - splunk_idx
+
+# MUST FOLLOW THE CLUSTER MANAGER, same reason as the peers: a search head that
+# joins a manager not yet in manager mode is configured but never registers,
+# and neither side reports an error.
+- name: Splunk search head
+  hosts: splunk_search_head
+  gather_facts: true
+  become: true
+  roles:
+    - splunk
+    - splunk_search_head
+    # The search head holds the same license as the peers and must also be
+    # demoted to a license peer. It is not named in Splunk's duplicate-license
+    # warning only because the cluster manager compares licenses across its
+    # PEERS and a search head is not one -- fixing only the hosts in the
+    # message would leave this duplicate in place.
+    - splunk_license_peer
+    # After splunk_search_head: ES is installed onto a host that is already a
+    # cluster search head, so its data models resolve against the peers.
+    - role: splunk-es
+      tags: ['splunk-es']
+    # After splunk-es: this role's smoke test queries a CIM data model, which
+    # does not exist until ES is installed.
+    - role: splunk-verify-user
+      tags: ['splunk-verify-user']
+  # The base role and the tier role share these tags on purpose. The base role
+  # rewrites server.conf in full and the [clustering] stanza lives in it, so
+  # running the base role without the tier role behind it silently strips the
+  # search head's cluster configuration.
+  tags:
+    - splunk
+    - splunk_sh
+
+# Every managed Windows and Linux host except the Splunk tier itself and the SO
+# control plane -- see [splunk_forwarder_exempt] in `hosts`.
+#
+# The `when:` tests splunk_indexers rather than an older single-server variable.
+# ss-pp-stacked found that gating on a retired variable silently SKIPS this
+# entire play the moment the variable is deleted, and a skipped play reports as
+# a clean run.
+- name: splunk forwarder
+  hosts: splunk-forwarder
+  gather_facts: true
+  become: true
+  roles:
+    - role: splunk-forwarder
+      when: splunk_indexers is defined and (splunk_indexers | length) > 0
+  tags:
+    - splunk-forwarder
+
+- name: Management plane — purge AD records and PROVE none remain
+  hosts: pdc
+  gather_facts: false
+  tasks:
+    - name: Remove every 10.255.240.0/20 A record from {{ domain_name }}, then recount
+      ansible.windows.win_powershell:
+        script: |
+          $zone = '{{ domain_name }}'
+          function Get-MgmtA {
+            Get-DnsServerResourceRecord -ZoneName $zone -RRType A -ErrorAction SilentlyContinue |
+              Where-Object {
+                $ip = $_.RecordData.IPv4Address.ToString()
+                if ($ip -notlike '10.255.*') { return $false }
+                $third = [int]($ip.Split('.')[2])
+                ($third -ge 240) -and ($third -le 255)
+              }
+          }
+          $stale = @(Get-MgmtA)
+          foreach ($r in $stale) {
+            Remove-DnsServerResourceRecord -ZoneName $zone -InputObject $r -Force -ErrorAction Stop
+          }
+          # Recount AFTER removing. Presence of a delete is not proof of
+          # absence -- the whole point of this play is that something may be
+          # putting them back.
+          $left = @(Get-MgmtA)
+          $names = ($stale | ForEach-Object { "$($_.HostName)=$($_.RecordData.IPv4Address)" }) -join ' '
+          $Ansible.Changed = ($stale.Count -gt 0)
+          Write-Output ("REMOVED=" + $stale.Count + " REMAINING=" + $left.Count + " " + $names)
+      register: mgmt_dns_purge
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} ({{ domain_name }}): {{ mgmt_dns_purge.output[0] }}"
+
+    - name: FAIL if any management-plane A record survived the purge
+      ansible.builtin.fail:
+        msg: |
+          {{ domain_name }} still publishes management-plane addresses after a
+          purge: {{ mgmt_dns_purge.output[0] }}
+
+          Clients resolving a DC name get both its production and its
+          10.255.240.x address and round-robin between them, so roughly half of
+          all Kerberos/LDAP/RPC traffic crosses the management plane. That
+          violates CLAUDE.md §8 and exposes out-of-scenario infrastructure to
+          anyone hunting in the SIEM.
+
+          A record that comes BACK after being deleted is being re-registered,
+          not left over. Check, on this DC:
+
+            Get-DnsClient | Select InterfaceAlias, RegisterThisConnectionsAddress
+              -> the management adapter must be False
+
+            Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters'
+              -> if the client setting is already False and records still
+                 return, Netlogon is registering them and needs
+                 DnsAvoidRegisterRecords set for the address record types.
+      when: "'REMAINING=0 ' not in (mgmt_dns_purge.output[0] ~ ' ')"
+
+# =========================================================================
+# SECURITY ONION  (branch `security-onion`)
+# =========================================================================
+# Everything above is the range baseline and is what `main` deploys. These
+# phases are the only difference between the two branches, which is why they
+# are appended rather than interleaved -- a diff against main shows the SO
+# work and nothing else.
+#
+# ORDERING IS LOAD-BEARING
+# ------------------------
+#   05  Windows clocks, before anything compares a Windows clock to a Linux
+#       one. DC-first, so Kerberos never sees a member outside tolerance.
+#   10  the mirror must exist before any SO node fetches the pinned source
+#   20  the GRE tunnel + tc rules must exist before a sensor can receive
+#   30  so_base stages the SO source on every grid node
+#   40  the MANAGER must fully complete before 50 -- search and sensor join
+#       it, and grid-join fails against a manager that is not yet green
+#   50  search + sensors, in parallel
+#   60  verification of the grid itself
+#   70  analyst access (Windows workstations, not the grid)
+#   75  endpoint telemetry (Sysmon check + Elastic Agent into Fleet)
+#   76  central syslog into SO, via the agent 75 put on soc-syslog
+#
+# WHY 05-time IS HERE AND NOT EARLIER
+# -----------------------------------
+# Every Windows host in the range runs hours fast: the platform sets the RTC
+# to UTC and Windows reads it as local time. They are all wrong by the SAME
+# amount, so AD and Kerberos stay internally consistent and the baseline
+# above deploys green without it -- which is exactly why it went unnoticed.
+# It only breaks when a Windows clock meets a Linux one, and the two things
+# that do that are both below: the SOC WebUI login flow (kratos compares
+# `expires_at` against the BROWSER's clock and every fresh flow looks
+# expired) and Elastic Agent events landing ahead of the sensor data.
+#
+# ITERATING
+# ---------
+# Re-running the ~49 baseline plays to test an SO change is slow. During
+# development run one phase directly:
+#     ansible-playbook playbooks/40-manager.yml
+# or scope by tag:  ansible-playbook site.yml --tags so
+# deploy.sh runs this file end to end.
+# =========================================================================
+
+- import_playbook: playbooks/05-time.yml
+- import_playbook: playbooks/20-vyos.yml
+- import_playbook: playbooks/30-prereqs.yml
+- import_playbook: playbooks/40-manager.yml
+- import_playbook: playbooks/50-nodes.yml
+- import_playbook: playbooks/60-verify.yml
+- import_playbook: playbooks/70-analyst.yml
+- import_playbook: playbooks/75-endpoint.yml
+
+# Host-scoped log sources into SO via dedicated Fleet policies: nginx on
+# bs-www, squid on bs-proxy, and both pfSense and VyOS on soc-syslog.
+# AFTER 75-endpoint: it reassigns the agents that phase enrols, so there has
+# to be an agent to reassign.
+- import_playbook: playbooks/80-fleet-integrations.yml

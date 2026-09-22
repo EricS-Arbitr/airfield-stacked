@@ -1,0 +1,617 @@
+#!/bin/bash
+#
+# verify_deployment.sh — read-only health check from the Ansible controller.
+#
+# Walks every tier deployed so far and confirms externally-visible state.
+# Uses `ansible -m win_shell` / `vyos_command` / `shell` and greps each
+# command's stdout for an expected literal — no JSON parsing, no value
+# extraction, much less fragile than the first cut.
+#
+# Usage:
+#   cd /etc/ansible && ./verify_deployment.sh           # summary
+#   cd /etc/ansible && ./verify_deployment.sh -v        # show ansible
+#                                                       # output for each fail
+#
+# Exit 0 if every check passes, 1 if any fails.
+
+set -u
+
+VERBOSE=0
+case "${1:-}" in
+  -v|--verbose) VERBOSE=1 ;;
+  -h|--help)    sed -n '2,15p' "$0"; exit 0 ;;
+esac
+
+# --- colors --------------------------------------------------------------
+if [ -t 1 ]; then
+  G=$'\033[32m'; R=$'\033[31m'; Y=$'\033[33m'; B=$'\033[36m'; D=$'\033[2m'; N=$'\033[0m'
+else
+  G=''; R=''; Y=''; B=''; D=''; N=''
+fi
+
+PASS=0
+FAIL=0
+declare -a FAILURES
+
+pass()    { printf "  ${G}✓${N} %s\n" "$1"; PASS=$((PASS+1)); }
+fail() {
+  printf "  ${R}✗${N} %s\n" "$1"
+  FAIL=$((FAIL+1))
+  FAILURES+=("$1")
+  if [ "$VERBOSE" -eq 1 ] && [ -n "${2:-}" ]; then
+    # collapse any output we got, indent
+    printf "      ${D}%s${N}\n" "$2" | head -5
+  fi
+}
+section() { printf "\n${B}━━ %s ━━${N}\n" "$1"; }
+note()    { printf "  ${D}%s${N}\n" "$1"; }
+
+A() { ansible "$@" 2>&1; }
+
+n_hosts() {
+  ansible "$1" --list-hosts 2>/dev/null | tail -n +2 | sed '/^$/d' | wc -l | tr -d ' '
+}
+
+# One reachability probe per group: pass if every host gets back SUCCESS|CHANGED.
+# Takes (group, module, command-string-or-empty, label).
+probe_group() {
+  local group="$1" module="$2" cmd="$3" label="$4"
+  local total ok out
+  total=$(n_hosts "$group")
+  if [ "$total" -eq 0 ]; then
+    note "$label: 0 hosts in inventory (skipping)"
+    return
+  fi
+  if [ -n "$cmd" ]; then
+    out=$(A "$group" -m "$module" -a "$cmd" --one-line)
+  else
+    out=$(A "$group" -m "$module" --one-line)
+  fi
+  ok=$(echo "$out" | grep -cE '\| (SUCCESS|CHANGED)')
+  if [ "$ok" -eq "$total" ]; then
+    pass "$label: $ok/$total reachable"
+  else
+    fail "$label: $ok/$total reachable" "$out"
+  fi
+}
+
+# Probe one Windows host with PowerShell via win_shell (stdout-based check).
+# Takes (host, ps-command, expected-grep-pattern, label).
+check_ps() {
+  local host="$1" ps="$2" expect="$3" label="$4"
+  local out
+  out=$(A "$host" -m ansible.windows.win_shell -a "$ps" --one-line)
+  if echo "$out" | grep -qE "$expect"; then
+    pass "$label"
+  else
+    fail "$label" "$out"
+  fi
+}
+
+# Probe one VyOS router with a vyos_command, grep stdout for pattern.
+check_vyos() {
+  local host="$1" cmd="$2" expect="$3" label="$4"
+  local out
+  out=$(A "$host" -m vyos.vyos.vyos_command -a "commands=\"$cmd\"" --one-line)
+  if echo "$out" | grep -qE "$expect"; then
+    pass "$label"
+  else
+    fail "$label" "$out"
+  fi
+}
+
+# Probe one pfSense with a shell command, grep stdout.
+check_pf_shell() {
+  local host="$1" cmd="$2" expect="$3" label="$4"
+  local out
+  out=$(A "$host" -m ansible.builtin.shell -a "$cmd" --one-line)
+  if echo "$out" | grep -qE "$expect"; then
+    pass "$label"
+  else
+    fail "$label" "$out"
+  fi
+}
+
+# Query Elasticsearch on the SO manager and grep the raw response.
+#
+# SEPARATE FROM check_pf_shell BECAUSE OF --become. so-elasticsearch-query
+# requires root; run unprivileged it produces NOTHING on stdout and exits
+# quietly. Section 9 was written with check_pf_shell on 2026-09-22 and every
+# dataset check failed on a healthy grid, because empty output is
+# indistinguishable from an empty index. playbooks/75-endpoint.yml has used
+# `become: true` for these queries all along.
+#
+# The command is kept deliberately quote-light -- one single-quoted URL, no
+# $( ), no variable assignment -- because it crosses ansible's free-form
+# argument parsing, which counts quotes and does not know it is looking at a
+# shell pipeline.
+check_so() {
+  local cmd="$1" expect="$2" label="$3"
+  local out
+  out=$(A soc-so-manager -m ansible.builtin.shell -a "$cmd" --become --one-line)
+  if echo "$out" | grep -qE "$expect"; then
+    pass "$label"
+  else
+    fail "$label" "$out"
+  fi
+}
+
+# Count Windows hosts in a group that satisfy a PowerShell predicate.
+# The PS one-liner should print a single token per host that grep can match.
+count_ps_predicate() {
+  local group="$1" ps="$2" expect="$3"
+  A "$group" -m ansible.windows.win_shell -a "$ps" --one-line \
+    | grep -cE "$expect"
+}
+
+# =========================================================================
+# 1. Inventory reachability
+# =========================================================================
+section "1. Inventory reachability"
+
+probe_group vyos    vyos.vyos.vyos_facts  ""                "VyOS routers (network_cli)"
+probe_group pfsense ansible.builtin.shell "echo ok"         "pfSense firewalls (ssh)"
+probe_group linux   ansible.builtin.ping  ""                "Linux hosts (ssh)"
+probe_group windows ansible.windows.win_ping ""             "Windows hosts (winrm)"
+
+# =========================================================================
+# 2. Network — routing convergence
+# =========================================================================
+section "2. Network — routing convergence"
+
+check_pf_shell bs-ops-fw \
+  'ifconfig vmx1 | awk "/inet /{print \$2; exit}"' \
+  '172\.31\.1\.14' \
+  "bs-ops-fw vmx1 (SWITCH_3) bound to 172.31.1.14"
+
+check_pf_shell bs-ops-fw \
+  'netstat -rn -f inet | awk "/^172.31.2.0/"' \
+  '172\.31\.1\.13' \
+  "bs-ops-fw kernel FIB has 172.31.2.0/24 via 172.31.1.13 (vmx1)"
+
+# FRR-RIB vs kernel-FIB divergence check -- explicitly catches the
+# dhclient-poisoning failure mode (UPSTREAM_FIXES.md 2026-06-30) where FRR
+# reports `O>*` for a route (its "installed" marker) but the kernel FIB
+# doesn't actually have it. Compare the two views for 172.31.2.0/24
+# (the blackstone-DC-reachability route from behind bs-ops-fw). Divergence here
+# would break Eng + SOC domain joins.
+check_pf_shell bs-ops-fw \
+  'frr_installed=$(vtysh -c "show ip route" 2>/dev/null | grep "172.31.2.0/24" | grep -c ">"); kernel_has=$(netstat -rn -f inet 2>/dev/null | grep -c "^172.31.2.0"); if [ "$frr_installed" -ge 1 ] && [ "$kernel_has" -ge 1 ]; then echo "OK_MATCH frr=$frr_installed kernel=$kernel_has"; elif [ "$frr_installed" -ge 1 ] && [ "$kernel_has" -eq 0 ]; then echo "DIVERGENCE frr=$frr_installed kernel=0 (dhclient poisoning? see UPSTREAM_FIXES.md 2026-06-30)"; else echo "NO_ROUTE frr=$frr_installed kernel=$kernel_has"; fi' \
+  'OK_MATCH' \
+  "bs-ops-fw FRR-RIB and kernel-FIB agree on 172.31.2.0/24 (no zebra poisoning)"
+
+for rtr in bs-edge-rtr bs-core-rtr bs-ops-rtr bs-sec-rtr bs-modbus-gateway; do
+  check_vyos "$rtr" \
+    "show ip route 0.0.0.0/0" \
+    'static|S\\*|S>|ospf|O>' \
+    "$rtr default route present"
+done
+
+for fw in bs-edge-fw bs-ops-fw; do
+  check_pf_shell "$fw" \
+    'vtysh -c "show ip ospf neighbor"' \
+    'Full/' \
+    "$fw OSPF: at least one Full neighbor"
+done
+
+check_pf_shell bs-edge-fw \
+  'vtysh -c "show ip bgp summary"' \
+  'Establ|\(Policy\)' \
+  "bs-edge-fw eBGP session Established to bs-edge-rtr"
+
+# =========================================================================
+# 3. Active Directory — blackstone.mil + fops.blackstone.mil
+# --- No Windows host is pinned to the impostor gateway MAC ----------------
+# Fleet-wide, not a spot check, because this fault picks hosts at random. One
+# MAC answers ARP for the default-gateway address on whatever segment it
+# appears on, and it ANSWERS ICMP -- so the gateway pings while nothing routes
+# off-subnet. It presents as DNS failures, domain joins failing and Fleet
+# enrolment failing, never as "the network is down".
+#
+# roles/init pins the real MAC as a Permanent neighbour entry on every Windows
+# host. This asks whether any host still holds the impostor, which is both a
+# regression check on that task and the fastest explanation available for a
+# host that is mysteriously half-built.
+# count_ps_predicate and A() already exist for exactly this shape -- reuse
+# them rather than reaching for `ansible` directly, which would bypass the
+# script's inventory and verbosity handling.
+arp_bad=$(count_ps_predicate windows \
+  'if (Get-NetNeighbor -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.LinkLayerAddress -eq "00-50-56-98-7D-D7" }) { "IMPOSTOR_MAC_PRESENT" } else { "GW_MAC_CLEAN" }' \
+  'IMPOSTOR_MAC_PRESENT')
+arp_total=$(n_hosts windows)
+if [ "${arp_bad:-0}" -eq 0 ]; then
+  pass "impostor gateway MAC absent from all $arp_total Windows hosts"
+else
+  fail "impostor gateway MAC present on $arp_bad of $arp_total Windows hosts — those hosts cannot route off-subnet"
+fi
+
+# =========================================================================
+section "3. Active Directory"
+
+# simspace in Domain Admins on each forest
+for dc in bs-dc01:blackstone.mil fops-dc01:fops.blackstone.mil; do
+  host="${dc%%:*}"; forest="${dc##*:}"
+  check_ps "$host" \
+    'Get-ADGroupMember "Domain Admins" | Where-Object { $_.Name -eq "simspace" } | Select-Object -ExpandProperty Name' \
+    '\(stdout\)[[:space:]]+simspace' \
+    "$forest: simspace is in Domain Admins"
+done
+
+# Per-workstation domain users (one per Windows workstation, all in Domain
+# Admins -- see group_vars/{blackstone,fops}.yml DomainUsers lists).
+# blackstone.mil expects >= 27 user members (simspace + 26 named workstation users);
+# fops.blackstone.mil expects >= 13 (simspace + 12 named). The builtin Administrator
+# is typically also a DA member -- the floor checks catch a partial create_users
+# run without false-failing on count drift.
+check_ps bs-dc01 \
+  '$c=(Get-ADGroupMember "Domain Admins" -Recursive | Where-Object {$_.objectClass -eq "user"}).Count; if ($c -ge 27) {"OK_$c"} else {"LOW_$c"}' \
+  '\(stdout\)[[:space:]]+OK_' \
+  "blackstone.mil: >= 27 named users in Domain Admins (simspace + 26 workstation users)"
+
+check_ps fops-dc01 \
+  '$c=(Get-ADGroupMember "Domain Admins" -Recursive | Where-Object {$_.objectClass -eq "user"}).Count; if ($c -ge 13) {"OK_$c"} else {"LOW_$c"}' \
+  '\(stdout\)[[:space:]]+OK_' \
+  "fops.blackstone.mil: >= 13 named users in Domain Admins (simspace + 12 workstation users)"
+
+# Spot-check one specific named user exists + enabled on each domain.
+# ahmed.ortega is a PowerPlant-roster name (validates the main path);
+# emma.rodriguez is one of the 5 names new to airfield-range (validates
+# the new-names branch in fops.yml).
+check_ps bs-dc01 \
+  'try { (Get-ADUser ahmed.ortega -Properties Enabled).Enabled } catch { "MISSING" }' \
+  '\(stdout\)[[:space:]]+True' \
+  "blackstone.mil: ahmed.ortega exists and is enabled (PowerPlant-roster user)"
+
+check_ps fops-dc01 \
+  'try { (Get-ADUser emma.rodriguez -Properties Enabled).Enabled } catch { "MISSING" }' \
+  '\(stdout\)[[:space:]]+True' \
+  "fops.blackstone.mil: emma.rodriguez exists and is enabled (new airfield-range user)"
+
+# Both additional DCs promoted (PartOfDomain == True)
+for adc in bs-dc02 fops-dc02; do
+  check_ps "$adc" \
+    '(Get-WmiObject Win32_ComputerSystem).PartOfDomain' \
+    '\(stdout\)[[:space:]]+True' \
+    "$adc: PartOfDomain True (additional DC promoted)"
+done
+
+# Parent/child trust — automatic in a single AD forest. Query Get-ADTrust
+# from either side; expect the OTHER domain listed as a `ParentChild` trust
+# (direction: BiDirectional). No shared secret involved.
+check_ps bs-dc01 \
+  '(Get-ADTrust -Filter * | Where-Object {$_.Target -eq "fops.blackstone.mil"}).TrustType' \
+  '\(stdout\)[[:space:]]+(ParentChild|Uplevel|[24])' \
+  "blackstone.mil forest root sees fops child domain via ParentChild trust"
+
+check_ps fops-dc01 \
+  '(Get-ADTrust -Filter * | Where-Object {$_.Target -eq "blackstone.mil"}).TrustType' \
+  '\(stdout\)[[:space:]]+(ParentChild|Uplevel|[24])' \
+  "fops.blackstone.mil child sees blackstone.mil parent via ParentChild trust"
+
+# Member join counts (each host echoes True/False to its stdout)
+for grp in members_blackstone members_fops; do
+  total=$(n_hosts "$grp")
+  joined=$(count_ps_predicate "$grp" \
+    '(Get-WmiObject Win32_ComputerSystem).PartOfDomain' \
+    '\(stdout\)[[:space:]]+True')
+  if [ "$joined" -eq "$total" ] && [ "$total" -gt 0 ]; then
+    pass "$grp: $joined/$total hosts domain-joined"
+  else
+    fail "$grp: $joined/$total hosts domain-joined"
+  fi
+done
+
+# DNS forwarders set on each PDC
+for dc in bs-dc01 fops-dc01; do
+  check_ps "$dc" \
+    '(Get-DnsServerForwarder).IPAddress.IPAddressToString -join ","' \
+    '8\.8\.8\.8.*1\.1\.1\.1|1\.1\.1\.1.*8\.8\.8\.8' \
+    "$dc DNS forwarders → is-inet aliases (8.8.8.8 / 8.8.4.4 / 1.1.1.1)"
+done
+
+# =========================================================================
+# 4. File services
+# =========================================================================
+section "4. File services"
+
+for dc in bs-dc01:blackstone.mil fops-dc01:fops.blackstone.mil; do
+  host="${dc%%:*}"; forest="${dc##*:}"
+  check_ps "$host" \
+    'Get-GPO -All | Where-Object { $_.DisplayName -eq "Mapped Network Drives" } | Select-Object -ExpandProperty DisplayName' \
+    '\(stdout\)[[:space:]]+Mapped Network Drives' \
+    "$forest: 'Mapped Network Drives' GPO exists"
+done
+
+for fs in bs-file01:blackstone.mil fops-file01:fops.blackstone.mil; do
+  host="${fs%%:*}"; forest="${fs##*:}"
+  check_ps "$host" \
+    'Get-SmbShare -Name "Share" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name' \
+    '\(stdout\)[[:space:]]+Share' \
+    "$forest: \\\\$host.$forest\\Share is exposed"
+done
+
+# =========================================================================
+# 5. SOC tier — syslog collector
+# =========================================================================
+section "5. SOC tier — syslog collector"
+
+# rsyslog collector listens on UDP+TCP 514 (per syslog_server role).
+check_pf_shell soc-syslog \
+  'ss -lnu | grep -qE ":514\\b" && ss -lnt | grep -qE ":514\\b" && echo LISTENERS_OK || echo LISTENERS_MISSING' \
+  'LISTENERS_OK' \
+  "soc-syslog listening on UDP+TCP 514"
+
+# Each pfSense firewall has a per-source log file under /var/log/remote/.
+# VyOS routers land under /var/log/remote/<hostname>/ (rsyslog reads the
+# syslog HOSTNAME field). pfSense's built-in syslogd doesn't populate a
+# HOSTNAME field the customer's syslog_server rsyslog template can pick up,
+# so pfSense sources land under /var/log/remote/<source-ip>/ instead --
+# confirmed on the PowerPlant range 2026-07-06 and logged there in
+# UPSTREAM_FIXES.md as a gap in the range-development-ansible syslog_server
+# role. Same behavior expected here since it's the same pfSense image +
+# same collector role.
+#
+# The check accepts EITHER /var/log/remote/<hostname>/syslog.log OR any
+# freshly-mtime'd syslog.log directly under /var/log/remote/172.31.1.*/
+# (the transit /30 subnets that firewalls source from when talking to
+# soc-syslog at 172.31.7.13). If it fails on a real deploy, run this
+# to find the exact source-IP and hardcode it like PowerPlant did:
+#   ansible bs-edge-fw,bs-ops-fw -b -m shell -a 'ifconfig | awk "/inet 172\\.31\\.1\\./{print \$2}"'
+for fw in bs-edge-fw bs-ops-fw; do
+  check_pf_shell soc-syslog \
+    "if [ -f /var/log/remote/$fw/syslog.log ]; then age=\$((\$(date +%s) - \$(stat -c %Y /var/log/remote/$fw/syslog.log))); [ \$age -lt 600 ] && echo OK_FRESH_HOSTNAME || echo STALE_HOSTNAME; else fresh=\$(find /var/log/remote -mindepth 2 -maxdepth 2 -name syslog.log -path '*/172.31.1.*/*' -mmin -10 2>/dev/null | head -1); [ -n \"\$fresh\" ] && echo OK_FRESH_IPDIR || echo STALE_OR_MISSING; fi" \
+    'OK_FRESH' \
+    "soc-syslog receiving from $fw (log mtime <10min; hostname or IP dir)"
+done
+
+# =========================================================================
+# 6. SOC tier — endpoint telemetry
+# =========================================================================
+section "6. SOC tier — endpoint telemetry"
+
+# Sysmon service spot checks — proves the sysmon role landed the config +
+# started Sysmon64 service. Sysmon events reach Security Onion via the
+# Elastic Agent enrolled by playbooks/75-endpoint.yml, which reads the
+# Microsoft-Windows-Sysmon/Operational channel.
+check_ps bs-hq01 \
+  '(Get-Service Sysmon64 -ErrorAction SilentlyContinue).Status' \
+  '\(stdout\)[[:space:]]+Running' \
+  "bs-hq01 (blackstone): Sysmon64 service running"
+
+check_ps fops-ops01 \
+  '(Get-Service Sysmon64 -ErrorAction SilentlyContinue).Status' \
+  '\(stdout\)[[:space:]]+Running' \
+  "fops-ops01 (fops): Sysmon64 service running"
+
+# =========================================================================
+# 7. Enterprise services — root certs, AUE lockdown, autologin, squid, global_dns
+# =========================================================================
+section "7. Enterprise services"
+
+# root_certs role installed the SimSpace lab-CA (root_ca.crt) into every
+# Windows host's Trusted Root store. Spot-check on bs-hq01.
+check_ps bs-hq01 \
+  'if (Get-ChildItem Cert:\LocalMachine\Root -ErrorAction SilentlyContinue | Where-Object {$_.Subject -match "SimSpace|root_ca|simspace"}) { "PRESENT" } else { "MISSING" }' \
+  '\(stdout\)[[:space:]]+PRESENT' \
+  "bs-hq01 (blackstone): SimSpace root CA installed in Trusted Root store"
+
+# AUE lockdown -- disable_uac role sets EnableLUA=0
+check_ps bs-hq01 \
+  '(Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -ErrorAction SilentlyContinue).EnableLUA' \
+  '\(stdout\)[[:space:]]+0' \
+  "bs-hq01 (blackstone): UAC disabled (proves disable_uac / AUE lockdown ran)"
+
+# autologin role sets DefaultUserName in Winlogon to the host's logon_user
+# (host_vars mapping: bs-hq01 -> ahmed.ortega).
+check_ps bs-hq01 \
+  '(Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" -ErrorAction SilentlyContinue).DefaultUserName' \
+  '\(stdout\)[[:space:]]+ahmed\.ortega' \
+  "bs-hq01 (blackstone): autologin configured for ahmed.ortega"
+
+# Chrome role installed the browser. Test-Path is more portable than
+# Get-ItemProperty for install detection.
+check_ps bs-hq01 \
+  'if (Test-Path "C:\Program Files\Google\Chrome\Application\chrome.exe") { "INSTALLED" } elseif (Test-Path "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe") { "INSTALLED" } else { "MISSING" }' \
+  '\(stdout\)[[:space:]]+INSTALLED' \
+  "bs-hq01 (blackstone): Chrome installed (proves chrome / AUE ran)"
+
+# bs-proxy — squid service active + listening on :3128
+check_pf_shell bs-proxy \
+  'systemctl is-active squid' \
+  'active' \
+  "bs-proxy: squid service active"
+
+check_pf_shell bs-proxy \
+  'ss -lnt | grep -qE ":3128\\b" && echo OK_3128 || echo MISSING_3128' \
+  'OK_3128' \
+  "bs-proxy: listening on :3128 (squid HTTP proxy)"
+
+# is-inet global_dns -- unbound should resolve www.faa.gov to the value
+# in group_vars/all.yml global_dns_records (70.39.65.10). Query via
+# `docker exec is-inet nslookup <name> 8.8.8.8` -- 8.8.8.8 is a loopback
+# alias inside the is-inet container and unbound binds to it. Can't
+# query from soc-syslog: SOC (172.31.7.0/24) sits behind bs-ops-fw's
+# L3.5 default-deny boundary (CLAUDE.md §5), so packets to 8.8.8.8
+# never reach is-inet. Same for the apex/www checks below.
+check_pf_shell is-inet \
+  'r=$(docker exec is-inet nslookup www.faa.gov 8.8.8.8 2>/dev/null | awk "/^Address: / {print \$2; exit}"); [ "$r" = "70.39.65.10" ] && echo "OK_$r" || echo "GOT_$r"' \
+  'OK_70\.39\.65\.10' \
+  "is-inet: unbound resolves www.faa.gov -> 70.39.65.10 (global_dns loaded)"
+
+# =========================================================================
+# 8. Public web + email (Blackstone rebrand)
+# =========================================================================
+section "8. Public web + email"
+
+# bs-www serves the blackstone_www role's index.html. Reachable via the
+# DMZ IP directly (172.31.12.3) or via bs-edge-fw's NAT reflection at
+# 199.252.163.1 (which internal test clients can't easily reach, so we
+# probe the DMZ IP for a smoke test).
+check_pf_shell bs-www \
+  'systemctl is-active nginx' \
+  'active' \
+  "bs-www: nginx service active"
+
+check_pf_shell bs-www \
+  'curl -s -o /dev/null -w "%{http_code}" http://localhost/' \
+  '^200$|200' \
+  "bs-www: landing page returns HTTP 200"
+
+# is-inet unbound has the apex A records for both mail domains + bare
+# blackstone.mil. If any of these are missing, mail login and public
+# name resolution break.
+check_pf_shell is-inet \
+  'r=$(docker exec is-inet nslookup blackstone.mil 8.8.8.8 2>/dev/null | awk "/^Address: / {print \$2; exit}"); [ "$r" = "52.96.223.2" ] && echo "OK_$r" || echo "GOT_$r"' \
+  'OK_52\.96\.223\.2' \
+  "is-inet: unbound resolves blackstone.mil apex -> 52.96.223.2"
+
+check_pf_shell is-inet \
+  'r=$(docker exec is-inet nslookup fops.blackstone.mil 8.8.8.8 2>/dev/null | awk "/^Address: / {print \$2; exit}"); [ "$r" = "52.96.223.2" ] && echo "OK_$r" || echo "GOT_$r"' \
+  'OK_52\.96\.223\.2' \
+  "is-inet: unbound resolves fops.blackstone.mil apex -> 52.96.223.2"
+
+check_pf_shell is-inet \
+  'r=$(docker exec is-inet nslookup www.blackstone.mil 8.8.8.8 2>/dev/null | awk "/^Address: / {print \$2; exit}"); [ "$r" = "199.252.163.1" ] && echo "OK_$r" || echo "GOT_$r"' \
+  'OK_199\.252\.163\.1' \
+  "is-inet: unbound resolves www.blackstone.mil -> 199.252.163.1 (bs-edge-fw WAN)"
+
+# Email container up + Dovecot listening + our bob.burke test user exists.
+# Avoid Docker's `--format "{{.Status}}"` here -- Ansible tries to Jinja-
+# render the braces and fails. Grep the plain `docker ps` output instead.
+check_pf_shell is-inet \
+  'docker ps --filter name=email 2>&1 | grep -E "\\s+Up\\s+" | head -1' \
+  '\bUp\b' \
+  "is-inet: email container running"
+
+check_pf_shell is-inet \
+  'docker exec email getent passwd bob.burke 2>&1 | head -1' \
+  'bob.burke' \
+  "is-inet: bob.burke unix user exists in email container (mailbox provisioned)"
+
+# =========================================================================
+# 9. Security Onion — the Fleet integrations are actually INGESTING
+# =========================================================================
+# Sections 5 and 6 prove the plumbing exists: rsyslog is listening, Sysmon is
+# running, agents are installed. None of that proves a document reached
+# Elasticsearch, and the gap between the two has been real here more than once
+# -- on 2026-08-07 Zeek was discarding 100% of frames while every service check
+# passed, and on 2026-09-16 29% of pfSense documents were grok failures that no
+# "is it running" check could see.
+#
+# So these ask the datastore, with counts.
+section "9. Security Onion — Fleet integrations ingesting"
+
+# PREFLIGHT, AND IT GATES THE REST.
+#
+# Every check below reports "no documents" when it cannot query at all, and
+# those two states need different people looking at them. On 2026-09-22 this
+# section reported all six datasets empty on a grid that was ingesting
+# normally -- the queries were running unprivileged and returning nothing.
+# Six confident failures pointing at the wrong thing.
+#
+# So: prove the mechanism first. A cluster-health response means the tool
+# runs, the credentials work and Elasticsearch is up; anything below it is
+# then a real statement about data.
+so_query_ok=0
+if A soc-so-manager -m ansible.builtin.shell \
+     -a 'so-elasticsearch-query _cluster/health' --become --one-line 2>/dev/null \
+     | grep -qE '"status":"(green|yellow)"'; then
+  pass "soc-so-manager: Elasticsearch answers (query mechanism works)"
+  so_query_ok=1
+else
+  fail "soc-so-manager: cannot query Elasticsearch — every dataset check below would report 'no documents' whether or not data exists. Fix this first; do NOT go looking at the log sources."
+fi
+
+if [ "$so_query_ok" -eq 1 ]; then
+  # --- One check per integration, by its own verify field ------------------
+  # Fields match roles/so_fleet_integrations/defaults/main.yml. Querying the
+  # FIELD and not just the datastream is the point: an index can exist, and
+  # receive documents, while the pipeline that should populate url.path or
+  # source.ip does nothing.
+  #
+  # The expect pattern is "value":<non-zero>. No shell arithmetic, no $( ) --
+  # the regex does the comparing, which keeps the command simple enough to
+  # survive ansible's free-form argument parsing intact.
+  check_so \
+    'so-elasticsearch-query logs-nginx.access-default/_search?q=url.path:*&size=0&filter_path=hits.total' \
+    '"value":[1-9]' \
+    "nginx on bs-www: documents present in logs-nginx.access-default"
+
+  check_so \
+    'so-elasticsearch-query logs-squid.log-default/_search?q=source.ip:*&size=0&filter_path=hits.total' \
+    '"value":[1-9]' \
+    "squid on bs-proxy: documents present in logs-squid.log-default"
+
+  check_so \
+    'so-elasticsearch-query logs-pfsense.log-default/_search?q=source.ip:*&size=0&filter_path=hits.total' \
+    '"value":[1-9]' \
+    "pfSense firewalls: documents present in logs-pfsense.log-default"
+
+  check_so \
+    'so-elasticsearch-query logs-vyos-default/_search?q=log.file.path:*&size=0&filter_path=hits.total' \
+    '"value":[1-9]' \
+    "VyOS routers: documents present in logs-vyos-default"
+
+  # --- BOTH firewalls, not just one ---------------------------------------
+  # Until 2026-09-16 a single pfsense integration collapsed both firewalls
+  # into one source, so every document looked like it came from the same box
+  # and the dataset count looked perfectly healthy. Per-firewall attribution
+  # is the only thing that catches that; a total never will.
+  check_so \
+    'so-elasticsearch-query logs-pfsense.log-default/_search?q=bs-edge-fw&size=0&filter_path=hits.total' \
+    '"value":[1-9]' \
+    "pfSense: bs-edge-fw attributed in logs-pfsense.log-default"
+
+  check_so \
+    'so-elasticsearch-query logs-pfsense.log-default/_search?q=bs-ops-fw&size=0&filter_path=hits.total' \
+    '"value":[1-9]' \
+    "pfSense: bs-ops-fw attributed in logs-pfsense.log-default"
+
+  # --- Ingest pipeline errors, IN THESE FOUR DATASETS ----------------------
+  # Where the 2026-09-16 regression would reappear. A document that fails its
+  # pipeline still lands in the datastream, so it inflates every count above
+  # while carrying none of the parsed fields -- the dataset looks busy and is
+  # useless.
+  #
+  # THE INDEX LIST IS THE POINT. This asked `logs-*` on 2026-09-22 and failed
+  # on a healthy grid: all 190 hits were in logs-elastic_agent.fleet_server,
+  # the Elastic Agent's own self-monitoring, recording its startup churn
+  # against Elasticsearch ("dial tcp [::1]:9200: connect: connection refused",
+  # "failed to fetch elasticsearch version") from before Elasticsearch was
+  # listening. Every one of the four integration datasets held zero. A check
+  # scoped wider than its own claim reports other people's noise as your
+  # regression.
+  #
+  # NOTE the inverted sense: this one passes on ZERO, so it is the one check
+  # here that a blind query would pass. That is precisely why the preflight
+  # above gates it rather than letting it stand as reassurance.
+  check_so \
+    'so-elasticsearch-query logs-nginx.access-default,logs-squid.log-default,logs-pfsense.log-default,logs-vyos-default/_search?q=error.message:*&size=0&filter_path=hits.total' \
+    '"value":0' \
+    "no ingest-pipeline errors in the four integration datasets"
+fi
+
+# =========================================================================
+# Summary
+# =========================================================================
+section "Summary"
+
+total=$((PASS+FAIL))
+printf "  Total checks : %d\n" "$total"
+printf "  ${G}Pass${N}         : %d\n" "$PASS"
+printf "  ${R}Fail${N}         : %d\n" "$FAIL"
+
+if [ "$FAIL" -gt 0 ]; then
+  echo
+  echo "${R}Failed checks:${N}"
+  for f in "${FAILURES[@]}"; do echo "  • $f"; done
+  if [ "$VERBOSE" -eq 0 ]; then
+    echo
+    echo "${D}Re-run with -v to see ansible's output for each failure.${N}"
+  fi
+  exit 1
+fi
+
+echo
+printf "${G}All checks passed.${N}\n"
+exit 0

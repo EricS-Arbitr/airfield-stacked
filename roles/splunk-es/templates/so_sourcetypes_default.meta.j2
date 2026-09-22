@@ -1,0 +1,25 @@
+### Managed by Ansible — roles/splunk-es. Do not edit on the host.
+#
+# WITHOUT THIS FILE THE FIELD ALIASES ARE INVISIBLE, AND NOTHING SAYS SO.
+#
+# ss-pp-stacked 2026-09-04. props.conf was on disk with the right content, and
+# `btool props list zeek:json --debug` listed every FIELDALIAS as merged from
+# this app -- yet `index=zeek | table src` returned empty on 71,301 events.
+#
+# btool merges CONFIG FILES. It knows nothing about knowledge-object
+# VISIBILITY. A FIELDALIAS is a knowledge object, and without metadata
+# exporting it, it is scoped to this app's own context only: a search running
+# from the `search` app, or over REST with no app context, never sees it. The
+# config is simultaneously present, correct, merged, and inert.
+#
+# The symptom is deceptive because Splunk's built-in AUTO_KV_JSON = true parses
+# the JSON regardless, so raw fields like id.orig_h populate normally and only
+# the CIM aliases are missing. That reads as "the aliases are wrong" rather
+# than "the app cannot be seen".
+#
+# export = system makes them global, which is what a sourcetype definition
+# needs to be -- the whole point is that any search, from any app, resolves
+# Zeek and Suricata into the same CIM vocabulary as everything else.
+[]
+access = read : [ * ], write : [ admin, power ]
+export = system

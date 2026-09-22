@@ -1,0 +1,132 @@
+# Wait for the LOCAL LDAP endpoint on the DC. Previous version waited on
+# `{{ domain_name }}` (e.g. `fops.blackstone.mil:389`) which requires DNS
+# to resolve the domain's SRV/A records back to this host -- and on a
+# freshly-promoted child DC, that resolution isn't reliable until Netlogon
+# finishes writing its records, which can race with the wait. Waiting on
+# 127.0.0.1:389 directly probes AD services on this box without depending
+# on DNS. See UPSTREAM_FIXES.md 2026-07-13.
+- name: wait for LDAP (local endpoint)
+  ansible.windows.win_wait_for:
+    host: 127.0.0.1
+    port: 389
+    timeout: 600
+
+# LDAP answering does not mean ADWS is answering. Every task below this line
+# talks to Active Directory Web Services, not LDAP -- microsoft.ad.user and
+# microsoft.ad.group both go through the AD PowerShell stack, and so do the
+# Get-/Set-ADDefaultDomainPasswordPolicy calls. ADWS starts AFTER AD DS.
+#
+# On 2026-09-19 fops-dc01 passed the LDAP wait above and then failed every
+# single Create Users item with
+#
+#   Unable to find a default server with Active Directory Web Services running.
+#
+# ...which dropped it from every play below this one and cost the deploy. The
+# port-389 wait proved something true and irrelevant. Gate on what the next
+# step actually uses.
+- name: wait for ADWS on this DC
+  ansible.windows.win_shell: |
+    try {
+      $d = Get-ADDomain -Server $env:COMPUTERNAME -ErrorAction Stop
+      if ($d.DNSRoot) { "LOCAL_ADWS_READY" } else { "LOCAL_ADWS_NOT_READY" }
+    } catch { "LOCAL_ADWS_NOT_READY" }
+  register: local_adws
+  until: "'LOCAL_ADWS_READY' in (local_adws.stdout | default(''))"
+  retries: 40
+  delay: 15
+  changed_when: false
+  failed_when: false
+
+- name: Fail if this DC never answered ADWS
+  ansible.builtin.fail:
+    msg: |
+      {{ inventory_hostname }} did not answer Active Directory Web Services
+      locally after 600s. Every user and group task below needs ADWS, so
+      none of them can run.
+
+      Check, in order:
+        1. Get-Service ADWS        (should be Running)
+        2. Get-Service NTDS        (ADWS will not start before AD DS is up)
+        3. Get-ADDomain -Server $env:COMPUTERNAME
+  when: "'LOCAL_ADWS_READY' not in (local_adws.stdout | default(''))"
+
+# Pin every AD module call below to THIS DC, the same way the password-policy
+# shell tasks already pin -Server. Without it the modules ask the DC locator
+# for a default server, which is what produced the ADWS failure above -- a
+# freshly promoted DC cannot reliably locate itself.
+- name: Identify the local DC by computer name
+  ansible.windows.win_shell: $env:COMPUTERNAME
+  register: local_dc
+  changed_when: false
+
+# Both Get-/Set-ADDefaultDomainPasswordPolicy default to querying the
+# CURRENT USER's domain, not the local DC's. That breaks when Ansible
+# authenticates with a parent-forest EA credential (e.g. blackstone.mil\
+# Administrator on the child DC fops-dc01) -- Get-* tries to reach the
+# parent forest DC across the network via ADWS, which can fail with
+# ADServerDownException even when the local DC is fully functional.
+# Pin -Server $env:COMPUTERNAME so both calls always target the local DC.
+# See UPSTREAM_FIXES.md 2026-07-14.
+- name: Check current password complexity setting
+  ansible.windows.win_shell: (Get-ADDefaultDomainPasswordPolicy -Server $env:COMPUTERNAME).ComplexityEnabled
+  register: current_setting
+  changed_when: false
+
+- name: Disable password complexity in domain GPO
+  ansible.windows.win_shell: |
+    $dom = Get-ADDomain -Server $env:COMPUTERNAME
+    Set-ADDefaultDomainPasswordPolicy -Identity $dom.DistinguishedName -Server $env:COMPUTERNAME -ComplexityEnabled $false
+  when:
+    - current_setting.stdout | regex_search('True') != None
+
+
+- name: Create Users
+  microsoft.ad.user:
+    name: "{{ item.name }}"
+    password: "{{ item.password }}"
+    password_never_expires: yes
+    state: present
+    domain_server: "{{ local_dc.stdout | trim }}"
+  loop: "{{ DomainUsers }}"
+  when:
+    - DomainUsers is defined
+
+- name: Group Assignment
+  microsoft.ad.user:
+    name: "{{ item.name }}"
+    groups:
+      set: "{{ item.groups }}"
+    state: present
+    domain_server: "{{ local_dc.stdout | trim }}"
+  loop: "{{ DomainUsers }}"
+  when:
+    - item.groups is defined
+
+# microsoft.ad.user's `groups: set:` resolved "Domain Admins" against the
+# *Builtin* container (CN=Builtin) instead of the global group at
+# CN=Domain Admins,CN=Users — net result: simspace landed in
+# Builtin\Administrators rather than the global Domain Admins group, and
+# `Install-ADDSDomainController` rejected the credential. Belt-and-suspenders
+# pass with microsoft.ad.group resolves the group by sAMAccountName explicitly,
+# which lands the membership in the right group. See UPSTREAM_FIXES.md 2026-06-26.
+- name: Force-add Domain Users to their declared groups (explicit sAMAccountName)
+  microsoft.ad.group:
+    identity: "{{ item.1 }}"
+    members:
+      add: ["{{ item.0.name }}"]
+    domain_server: "{{ local_dc.stdout | trim }}"
+  with_subelements:
+    - "{{ DomainUsers }}"
+    - groups
+  when: DomainUsers is defined
+
+# Unconditional belt-and-suspenders: simspace is the lab convention admin
+# account (declared in group_vars/all.yml as `domain_admin`). The loop-based
+# tasks above can silently skip if a future schema change breaks the loop;
+# this one always runs.
+- name: Force-add the lab admin user to Domain Admins (no loop)
+  microsoft.ad.group:
+    identity: "Domain Admins"
+    members:
+      add: ["{{ domain_admin }}"]
+    domain_server: "{{ local_dc.stdout | trim }}"

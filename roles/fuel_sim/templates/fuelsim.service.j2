@@ -1,0 +1,24 @@
+[Unit]
+Description=Fuel Farm Simulator (field-bus Modbus slave + physics + replay)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=fuelsim
+Group=fuelsim
+WorkingDirectory=/opt/fuelsim
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/fuelsim/venv/bin/python /opt/fuelsim/bin/fuelsim.py --config /opt/fuelsim/config/fuelsim.yml
+Restart=on-failure
+RestartSec=5
+
+# Fuelsim binds Modbus TCP on :502 (privileged port <1024) but runs as
+# the unprivileged `fuelsim` user. Grant net_bind capability to this
+# service only rather than running as root or shifting
+# net.ipv4.ip_unprivileged_port_start system-wide.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

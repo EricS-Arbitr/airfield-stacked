@@ -1,0 +1,36 @@
+---
+# host_vars/soc-splunk.yml — Splunk SEARCH HEAD (Linux)
+# Image:   global/RDP_Ubuntu_Desktop_22.04.5:1.1.0
+# Mgmt:    10.255.240.187/20 (position FIRST → eth0)
+# Prod:    172.31.7.25/24 on SOC, gateway bs-sec-rtr (172.31.7.1)
+ansible_host: "10.255.240.187"
+network_interfaces:
+  - name: "eth0"                     # mgmt (position FIRST)
+    ipv4:
+      type: "ethernet"
+      address: "10.255.240.187"
+      netmask: "255.255.240.0"
+      gateway: ""
+  - name: "eth1"                     # production — SOC
+    ipv4:
+      type: "ethernet"
+      address: "172.31.7.25"
+      netmask: "255.255.255.0"
+      gateway: "172.31.7.1"
+    dns:
+      - "172.31.2.7"                 # bs-dc01
+      - "172.31.2.8"                 # bs-dc02
+
+# --- Splunk role contract -------------------------------------------------
+# Where analysts log in, and where Enterprise Security runs. It searches the
+# indexer peers; it does not index the cluster's data itself.
+#
+# Sized from ss-pp-stacked's pp-splunk (32 vCPU / 64 GB): the search head
+# carries ES correlation searches and data-model acceleration, which is the
+# heaviest sustained load in the tier.
+#
+# NOT in [splunk-forwarder]: this host IS Splunk. It is listed in
+# [splunk_forwarder_exempt] via [splunk_all], so the forwarder-coverage gate
+# in playbooks/75-endpoint.yml treats its absence as a decision rather than a
+# gap. It DOES carry an Elastic Agent -- Security Onion monitors the Splunk
+# tier, exactly as Splunk monitors the SO sensors.

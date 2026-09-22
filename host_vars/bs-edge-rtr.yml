@@ -1,0 +1,89 @@
+---
+# host_vars/bs-edge-rtr.yml — VyOS router (WAN edge, eBGP AS 65002)
+# Image:   RC-VyOS-Router:1.1.0
+# Mgmt:    10.255.240.133/20 (position LAST → eth2; SimSpace-managed)
+#
+# Role: simulated ISP-side edge router. eBGP peers with bs-edge-fw at
+# 199.252.163.1 (AS 65001 ↔ AS 65002), default points at is-inet.
+# No OSPF (eBGP edge).
+ansible_host: "10.255.240.133"
+
+network_interfaces:
+  - name: "eth0"                     # Internet — peers to is-inet (200.200.200.2)
+    ipv4:
+      address: "200.200.200.1"
+      netmask: "255.255.255.0"
+      type: "ethernet"
+  - name: "eth1"                     # switch-0 transit to bs-edge-fw (eBGP)
+    ipv4:
+      address: "199.252.163.2"
+      netmask: "255.255.255.252"
+      type: "ethernet"
+
+static_route:
+  route: "0.0.0.0/0"
+  next_hop: "200.200.200.2"          # is-inet (simulated upstream)
+
+# Return-path route to corp. Without this, is-inet's replies to corp
+# hosts (destination 172.31.x.x) fall to bs-edge-rtr's default, which
+# points BACK at is-inet -- routing loop / TTL exhaust. bs-edge-fw's
+# outbound NAT masks corp source IPs to 199.252.163.1 (WAN), so on
+# the return path we just need bs-edge-rtr to know 172.31.0.0/16 is
+# reached via 199.252.163.1. Consumed by the customer vyos role's
+# "Additional VyOS static routes" overlay play (tag `extra_static_routes`).
+# See airfield-range UPSTREAM_FIXES.md 2026-07-08 entry.
+extra_static_routes:
+  - network: "172.31.0.0/16"         # site.yml "Push extra static routes" expects `network`, not `route`
+    next_hop: "199.252.163.1"        # bs-edge-fw WAN (SNAT egress + corp return)
+
+# eBGP AS 65002 toward bs-edge-fw (AS 65001) — the only BGP session in
+# the fabric. The customer vyos role auto-emits `redistribute connected`
+# + `redistribute static` so the corp side learns 200.200.200.0/24 and
+# the default route.
+bgp:
+  - as: 65002
+    neighbor:
+      ip: "199.252.163.1"            # bs-edge-fw (AS 65001 — eBGP)
+      as: 65001
+
+# SimSpace VyOS image bakes `0.0.0.0/0 next-hop 200.200.200.1` (own eth0
+# IP). Strip the self-loop so only the real default toward is-inet stays.
+# See UPSTREAM_FIXES.md (VyOS image-baked self-loop pattern).
+extra_static_routes_remove:
+  - network: "0.0.0.0/0"
+    next_hop: "200.200.200.1"        # own eth0 IP (self-loop, image artifact)
+
+# =========================================================================
+# Security Onion GRE mirror — pairs with soc-sensor-edge
+# =========================================================================
+# Added 2026-08-11 with the SO blueprint additions. vyos_mirror builds a GRE
+# tunnel to the sensor and installs `tc mirred` rules that copy each source
+# interface into it. Suricata + Zeek on the sensor bind to tun0.
+#
+# ** VERIFY INTERFACE NUMBERING ON THE LIVE DEVICE FIRST. ** Blueprint NIC
+# order did not match VyOS ethN on the so-ansible dev range
+# (PORTING_GUIDE 9.9). `show interfaces` on bs-edge-rtr and reconcile before
+# deploying. The addresses below are drafted from this file's own
+# network_interfaces, which is what the blueprint SHOULD produce.
+#
+# eth1 199.252.163.2 is the transit /30 to bs-edge-fw and carries the GRE -- deliberately NOT mirrored. Mirroring the transit that
+# carries the tunnel is how you build a feedback loop.
+vyos_mirror_source_interfaces:
+  - eth0   # 200.200.200.1  simulated internet
+
+# ** DRAFT — VERIFY. ** Must be an address on this router with a route to
+# 172.31.7.0/24 (the sensors sit behind bs-sec-rtr behind bs-ops-fw). This
+# value MUST equal so_gre_remote_underlay in host_vars/soc-sensor-edge.yml exactly;
+# a mismatch gives a tunnel that is UP with zero RX forever.
+vyos_gre_source_ip: "199.252.163.2"
+vyos_gre_remote_ip: "172.31.7.24"      # soc-sensor-edge prod IP
+vyos_gre_local_addr: "10.100.4.1"
+vyos_gre_remote_addr: "10.100.4.2"
+vyos_gre_tunnel_prefix: 30
+
+# Do NOT mirror management-plane traffic. Where a mgmt IP shares a data-plane
+# interface, a bare matchall mirror copies every Ansible SSH/WinRM session into
+# the sensor -- out-of-band traffic that is invisible in-scenario and pollutes
+# detections. Rendered as tc `action pass` filters ahead of the catch-all.
+vyos_mirror_exclude_cidrs:
+  - "10.255.240.0/20"

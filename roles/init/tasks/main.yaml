@@ -1,0 +1,60 @@
+---
+- name: wait for Windows systems to be online
+  ansible.builtin.wait_for_connection:
+    timeout: "{{ init_wait_timeout }}"
+    delay: "{{ init_wait_delay }}"
+    sleep: "{{ init_wait_sleep }}"
+
+# =========================================================================
+# Repair AND PIN the default-gateway ARP entry before anything routes
+# =========================================================================
+# MEASURED. One MAC, 00:50:56:98:7D:D7, answers ARP for the default-gateway
+# address on whatever segment it appears on. Seen on four subnets across three
+# independent ranges, always Windows-only -- Linux on the same wire ignores
+# unsolicited ARP for an address it did not ask about (arp_accept=0) while
+# Windows accepts the reply and overwrites its cache. Confirmed on Server 2019
+# and Windows 10, so it is not version-specific.
+#
+# IT ANSWERS ICMP. The gateway pings, so any check that stops at "can I reach
+# my gateway" reports healthy while nothing routes off-subnet. It presents as
+# DNS failures, domain joins failing, Fleet enrolment failing -- and the router
+# meanwhile shows the host's own ARP entry going STALE, because it never
+# receives a packet.
+#
+# A FLUSH ALONE IS NOT ENOUGH, which an earlier version of this task assumed.
+# On 2026-08-27 one flush appeared to hold across all 45 hosts and the
+# conclusion drawn was that the entry is planted once at boot. It is not: on
+# 2026-08-31 hosts repaired by this very task had reverted to the impostor MAC
+# by the end of the same run, with NO reboot (uptime 3 days on both a reverted
+# host and a healthy one). The impostor re-announces, so the entry must be
+# PINNED, not merely corrected.
+#
+# A Permanent neighbour entry cannot be overwritten by a forged reply.
+# Verified on win-hunt-3 2026-08-31: State=Permanent, off-subnet reachability
+# restored. Note that verifying a pin requires reading State -- reading
+# LinkLayerAddress alone cannot distinguish a pinned entry from a dynamic one
+# that happened to re-learn correctly, which is how an earlier manual attempt
+# was mistakenly believed to have worked.
+#
+# SAFETY. Pinning the wrong MAC would isolate the host, so the pin is only
+# written after the learned MAC is confirmed NOT blocklisted AND an off-subnet
+# host is confirmed reachable, and it is removed again if reachability breaks
+# afterwards. The probe target is the host's own configured DNS server: in
+# every range these roles serve, that is off-subnet, so it proves routing
+# rather than merely proving the gateway answers.
+#
+# This is a workaround for a platform behaviour. 00:50:56:98:7D:D7 is in a
+# different VMware MAC block (:98:) from every real router interface (:A8:) and
+# recurs across independent ranges, so only the platform vendor can remove the
+# cause.
+# Between "it answered" and "we start configuring it". See wait_stable.yml:
+# wait_for_connection returns on the first successful connection, which a host
+# mid-provisioning can give while still about to reboot.
+- name: Require the host to be stably up before configuring it
+  ansible.builtin.include_tasks: wait_stable.yml
+
+- name: Repair and pin the default-gateway ARP entry
+  ansible.builtin.include_tasks: gw_arp.yml
+
+- name: Ping test to verify connectivity
+  win_ping:

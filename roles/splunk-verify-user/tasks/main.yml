@@ -1,0 +1,196 @@
+---
+# =========================================================================
+# splunk-verify-user — least-privilege Splunk account for verify_deployment.sh
+# =========================================================================
+# Runs after splunk-es so the CIM data models exist before the smoke test at
+# the bottom queries one. See defaults/main.yml for why this exists.
+# =========================================================================
+
+- name: Create the verification app directories
+  ansible.builtin.file:
+    path: "{{ splunk_verify_app_dir }}/{{ item }}"
+    state: directory
+    mode: '0755'
+  loop:
+    - local
+    - bin
+
+# A dedicated app rather than system/local so the whole grant is one
+# removable directory and never merges with Splunk's shipped authorize.conf.
+- name: Define the scoped verification role
+  ansible.builtin.template:
+    src: authorize.conf.j2
+    dest: "{{ splunk_verify_app_dir }}/local/authorize.conf"
+    mode: '0644'
+  register: verify_authorize
+
+# authorize.conf is read at startup; the role must exist before a user can be
+# assigned to it, so this restart cannot be deferred to the end of the play.
+- name: Restart Splunk so the new role is loaded
+  ansible.builtin.shell: /opt/splunk/bin/splunk restart
+  when: verify_authorize.changed
+  changed_when: true
+
+- name: Wait for the Splunk REST API after the role reload
+  ansible.builtin.uri:
+    url: "https://127.0.0.1:8089/services/server/info"
+    method: GET
+    user: "{{ splunk_admin }}"
+    password: "{{ splunk_admin_password }}"
+    force_basic_auth: true
+    validate_certs: false
+    status_code: 200
+  register: verify_api_check
+  retries: 20
+  delay: 15
+  until: verify_api_check.status == 200
+
+- name: Create or update the verification account
+  ansible.builtin.shell: |
+    set -o pipefail
+    if /opt/splunk/bin/splunk list user -auth '{{ splunk_admin }}:{{ splunk_admin_password }}' \
+         | grep -qw '{{ splunk_verify_user }}'; then
+      /opt/splunk/bin/splunk edit user '{{ splunk_verify_user }}' \
+        -password '{{ splunk_verify_password }}' -role '{{ splunk_verify_role }}' \
+        -auth '{{ splunk_admin }}:{{ splunk_admin_password }}' >/dev/null
+      echo UPDATED
+    else
+      /opt/splunk/bin/splunk add user '{{ splunk_verify_user }}' \
+        -password '{{ splunk_verify_password }}' -role '{{ splunk_verify_role }}' \
+        -auth '{{ splunk_admin }}:{{ splunk_admin_password }}' >/dev/null
+      echo CREATED
+    fi
+  args:
+    executable: /bin/bash
+  register: verify_account
+  changed_when: "'CREATED' in verify_account.stdout"
+  no_log: true
+
+# Owned by the ansible SSH user, not root: verify_deployment.sh runs ad-hoc
+# `ansible -m shell` WITHOUT become (see the other checks in section 7), so a
+# root-only file would make every data-quality check fail on a read error and
+# look exactly like a mapping failure.
+- name: Write the credentials file the runner reads
+  ansible.builtin.copy:
+    content: "{{ splunk_verify_user }}:{{ splunk_verify_password }}"
+    dest: "{{ splunk_verify_auth_file }}"
+    owner: "{{ ansible_user }}"
+    mode: '0600'
+  no_log: true
+
+- name: Install the data-quality search runner
+  ansible.builtin.template:
+    src: verify_data.sh.j2
+    dest: "{{ splunk_verify_app_dir }}/bin/verify_data.sh"
+    mode: '0755'
+
+# --------------------------------------------------------------------------
+# Smoke test: prove the ACCOUNT works, not that the data is good.
+#
+# Deliberately does not fail on DM_SRC_EMPTY or DNS_NO_EVENTS -- a freshly
+# built range legitimately has no accelerated summaries and little traffic.
+#
+# 2026-08-18: it DOES now fail on VISIBILITY_FAIL. The original version of this
+# task asserted only that each search returned a recognised token, and a search
+# returning almost no data returns well-formed tokens perfectly well -- the
+# account appeared to see 85 of 454,659 events and PROC_CIM_OK passed on 13 of
+# them. Asserting the shape of a response is not asserting its content; that
+# was the same transport-vs-outcome error these checks exist to catch, made one
+# layer down inside the checker itself.
+#
+# The 85 turned out to be a `splunk search` CLI artefact rather than a grant
+# problem (see authorize.conf.j2), and the runner now uses REST. The gate stays
+# regardless: it is what made the discrepancy visible at all, and it is what
+# will catch the next one whatever its cause.
+# --------------------------------------------------------------------------
+- name: Run each verification check once as the scoped account
+  ansible.builtin.shell: "{{ splunk_verify_app_dir }}/bin/verify_data.sh {{ item.check }}"
+  become: true
+  become_user: "{{ ansible_user }}"
+  loop:
+    - { check: visibility, token: 'VISIBILITY_' }
+    - { check: apps,       token: 'SYSMON_ADDONS_' }
+    - { check: dns_src,    token: 'DNS_' }
+    - { check: proc_cim,   token: 'PROC_' }
+    - { check: dm_src,     token: 'DM_SRC_' }
+  loop_control:
+    label: "{{ item.check }}"
+  register: verify_smoke
+  changed_when: false
+  failed_when: false
+
+- name: Assert every check shape returned a recognised token
+  ansible.builtin.assert:
+    that:
+      - item.item.token in (item.stdout | default(''))
+    fail_msg: >-
+      verify_data.sh {{ item.item.check }} returned
+      '{{ (item.stdout | default('') ~ ' ' ~ item.stderr | default('')) | trim | truncate(300) }}'
+      instead of a {{ item.item.token }}* token. Either the
+      {{ splunk_verify_role }} role is missing a capability
+      ({{ splunk_verify_capabilities | join(', ') }}), or
+      {{ splunk_verify_user }} cannot see the index or data model the check
+      queries. Fix the grant -- do NOT hand the verifier the admin account.
+    success_msg: "{{ item.item.check }}: {{ (item.stdout | default('')) | trim | truncate(80) }}"
+  loop: "{{ verify_smoke.results }}"
+  loop_control:
+    label: "{{ item.item.check }}"
+
+# THE BLINDNESS GATE NEEDS A CONTROL.
+#
+# 2026-08-20, fresh deploy: this failed three attempts with
+# VISIBILITY_FAIL_0_raw_events. Zero was the CORRECT state -- this role runs
+# inside the search head play, which is ordered BEFORE the forwarder play, so
+# at this point in a cold deploy nothing has ever sent an event. The gate
+# treated "there is no data" as "the account cannot see the data", which are
+# the two things it exists to tell apart, and it had no way to tell them apart.
+#
+# The fix is the same controlled comparison that resolved the CLI truncation:
+# ask ADMIN the identical question through the identical interface. If admin
+# also sees nothing, there is nothing to be blind to. If admin sees data and
+# svc_verify does not, that is blindness and it still fails hard.
+#
+# Volume assertions belong in verify_deployment.sh, which runs after the whole
+# deploy. This role's job is to prove the GRANT works, not that data exists.
+- name: How many events can ADMIN see? (the control)
+  ansible.builtin.shell: |
+    set -o pipefail
+    printf 'user = "%s"\n' '{{ splunk_admin }}:{{ splunk_admin_password }}' \
+      | curl -sS -k -K - \
+        --url "https://127.0.0.1:{{ splunk_mgmt_port | default('8089') }}/services/search/jobs/export" \
+        --data-urlencode 'search=search index=* source="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" | stats count AS e | fields e' \
+        --data-urlencode "earliest_time={{ splunk_verify_window }}" \
+        --data-urlencode "latest_time=now" \
+        --data-urlencode "output_mode=csv" 2>/dev/null \
+      | tail -1 | tr -dc '0-9'
+  args:
+    executable: /bin/bash
+  register: admin_visible
+  changed_when: false
+  failed_when: false
+
+- name: Assert the verification account is not blind
+  ansible.builtin.assert:
+    that:
+      - (admin_visible.stdout | default('0') | trim | int) == 0
+        or ('VISIBILITY_OK' in (visibility_result.stdout | default('')))
+    quiet: false
+    fail_msg: >-
+      {{ splunk_verify_user }} is BLIND. Admin can see
+      {{ admin_visible.stdout | default('0') | trim }} events from the Sysmon
+      source through the same interface; {{ splunk_verify_user }} reports
+      {{ (visibility_result.stdout | default('(no output)')) | trim }}.
+      Two accounts, one interface, different answers -- that is a grant
+      problem, not a data problem. Run
+      '{{ splunk_verify_app_dir }}/bin/verify_data.sh indexes' to see what the
+      account CAN see. Do not relax the floor to make this pass.
+    success_msg: >-
+      {{ 'No data yet (admin sees 0 too) — grant unverified but not blind; verify_deployment.sh will check volume after the deploy.'
+         if (admin_visible.stdout | default('0') | trim | int) == 0
+         else 'Visibility gate: ' ~ ((visibility_result.stdout | default('')) | trim) }}
+  vars:
+    visibility_result: >-
+      {{ verify_smoke.results
+         | selectattr('item.check', 'equalto', 'visibility')
+         | list | first | default({}) }}
+  ignore_errors: "{{ not splunk_verify_fail_on_blind }}"

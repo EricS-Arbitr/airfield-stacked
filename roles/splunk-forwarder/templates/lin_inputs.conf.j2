@@ -1,0 +1,108 @@
+[default]
+host = {{ inventory_hostname }}
+
+{% if 'so_sensor' not in group_names %}
+[monitor:///var/log/syslog]
+index = linux
+sourcetype = linux_messages_syslog
+
+[monitor:///var/log/auth.log]
+index = linux
+sourcetype = linux_messages_syslog
+{% endif %}
+
+{% if 'so_sensor' in group_names %}
+# --- Security Onion sensor: network telemetry ONLY -----------------------
+# These hosts forward Zeek, Suricata and Strelka and NOTHING ELSE. No
+# /var/log/syslog, no auth.log -- the host telemetry stanzas above are
+# deliberately skipped for this group. The sensors exist to observe the
+# network; their own OS logs are Security Onion's business, not Splunk's, and
+# shipping them would double-count events already in Elasticsearch.
+#
+# so-manager and so-search get NO forwarder at all. Strelka runs on the
+# SENSORS in distributed SO 2.4 -- six containers each, none on the manager --
+# so there is nothing on those two hosts worth forwarding. Verified on the
+# range 2026-09-03: `docker ps | grep strelka` returns six containers on a
+# sensor and none on so-manager.
+#
+# Paths measured on the live range, not inferred:
+#   /nsm/zeek/logs/current    symlink -> /nsm/zeek/spool/logger, files 0644
+#   /nsm/suricata             eve-<date>-<hh:mm>.json, rotated hourly to .gz
+#   /nsm/strelka/log          strelka.log, 0644 socore:socore
+# All world-readable, so the forwarder needs no privilege escalation.
+
+# Zeek writes JSON (measured: {"ts":1788472794.948059,"uid":...}), so no
+# add-on is required -- KV_MODE=json on the search head parses it whole. That
+# matters here because NO Zeek add-on is available: /var/share/installers/
+# splunk/ does not exist on this range and pp-splunk ships no Zeek TA.
+#
+# BLACKLIST, NOT WHITELIST. The log set grows as traffic warrants -- kerberos,
+# known_certs, known_hosts and known_services all appear once seen. A
+# whitelist would silently miss every new protocol; a blacklist only has to
+# name the operational logs, which are a fixed set. Excluded here are Zeek's
+# own health logs, which describe Zeek rather than the network.
+[monitor:///nsm/zeek/logs/current/*.log]
+disabled = false
+index = zeek
+sourcetype = zeek:json
+blacklist = (analyzer|broker|capture_loss|cluster|conn-summary|loaded_scripts|packetloss|reporter|stats|stderr|stdout)\.log$
+
+# THE GLOB IS MANDATORY. Suricata names the live file with the hour it opened
+# -- eve-2026-09-03-23:09.json -- and rotates it to .gz about an hour later.
+# There is no eve.json. A conventional [monitor:///nsm/suricata/eve.json]
+# stanza, which is what every Suricata/Splunk guide gives you, collects
+# absolutely nothing here and looks perfectly correct while doing so.
+#
+# The blacklist is belt-and-braces: eve-*.json already cannot match a name
+# ending .json.gz. It is kept so the intent is stated rather than inferred
+# from glob semantics.
+[monitor:///nsm/suricata/eve-*.json]
+disabled = false
+index = suricata
+sourcetype = suricata:json
+blacklist = \.gz$
+
+# Strelka's log was EMPTY when this was written, and that is expected rather
+# than broken: it analyses files Zeek carves out of traffic, and with no user
+# emulation running there are none. It will populate once emulation starts, or
+# sooner if the mirror capture loss (see roles/vyos_mirror) is resolved --
+# incomplete files are never extracted.
+#
+# The sourcetype is therefore ASSUMED to be JSON from Strelka's documented
+# output format and has NOT been confirmed against a real event on this range.
+# Confirm before relying on field extraction.
+[monitor:///nsm/strelka/log/strelka.log]
+disabled = false
+index = strelka
+sourcetype = strelka:json
+{% endif %}
+
+{% if 'proxy' in group_names %}
+[monitor:///var/log/squid/access.log]
+index = proxy
+sourcetype = squid:access:recommended
+{% endif %}
+
+{% if 'wordpress-pv' in group_names %}
+[monitor:///var/lib/docker/containers/*/*-json.log]
+disabled = false
+index = main
+sourcetype = docker:container
+crcSalt = <SOURCE>
+{% endif %}
+
+{% if 'syslog' in group_names %}
+# Central syslog collector: tail per-host files dropped by rsyslog
+# (syslog_server role). The directory name segment becomes the host= field
+# so events show up in Splunk under the device that sent them, not pp-syslog.
+#
+# Linux clients (pp-www, pp-proxy, pp-splunk) and the syslog server itself
+# all live in [linux] / [splunk-forwarder] and already ship their own
+# /var/log/syslog directly via the monitor stanzas above. This stanza is
+# the ONLY source for vyos + pfsense events.
+[monitor:///var/log/remote/.../syslog.log]
+disabled = false
+index = netfw
+sourcetype = syslog
+host_segment = 4
+{% endif %}

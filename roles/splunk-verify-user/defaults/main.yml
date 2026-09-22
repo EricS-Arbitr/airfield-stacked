@@ -1,0 +1,74 @@
+---
+# =========================================================================
+# splunk-verify-user role defaults
+# =========================================================================
+# Creates a scoped, search-only Splunk account that verify_deployment.sh
+# uses to assert DATA QUALITY rather than transport.
+#
+# Why this role exists: section 7 of verify_deployment.sh checks that splunkd
+# is active, that :9997/:8000/:8089 are listening, and that forwarders hold
+# ESTABLISHED sockets. Every one of those passed for the entire period two
+# Sysmon add-ons were nulling each other's CIM fields (see
+# roles/splunk-es/defaults/main.yml). Sockets are not evidence that events
+# parse. Asserting that requires running searches, and running searches
+# requires credentials -- hence a dedicated least-privilege account instead
+# of handing the verifier the admin password.
+# =========================================================================
+
+splunk_verify_user: svc_verify
+splunk_verify_role: arbitr_verify
+
+# Self-contained app so the role definition is removable in one directory and
+# never collides with Splunk's shipped authorize.conf.
+# splunk_verify_app / splunk_verify_app_dir now live in group_vars/all/main.yml.
+# They are referenced from playbooks/75-endpoint.yml, which does not run this
+# role, and a role default is out of scope there. Kept here as a fallback so
+# the role still works standalone; group_vars wins when both are present.
+splunk_verify_app: arbitr_verify
+splunk_verify_app_dir: "/opt/splunk/etc/apps/{{ splunk_verify_app }}"
+
+# Read by the runner script on pp-splunk. Mode 0600, root-owned: the point of
+# the file is to keep the credential off the ansible command line, out of
+# verify_deployment.sh, and out of the verifier's own -v output.
+splunk_verify_auth_file: "{{ splunk_verify_app_dir }}/local/.auth"
+
+# Capabilities beyond the built-in `user` role. Kept explicit so the grant is
+# reviewable:
+#   rest_apps_view       -> `| rest /services/apps/local` (which add-ons are installed)
+#   rest_properties_get  -> reading configuration via REST
+# The role ASSERTS each search shape actually runs after creation, so a wrong
+# or renamed capability fails the deploy here rather than surfacing later as a
+# mysterious verification failure.
+splunk_verify_capabilities:
+  - rest_apps_view
+  - rest_properties_get
+
+# How far back the data-quality searches look. Sysmon DNS volume is low while
+# emulated users are off, so a 24h window can legitimately find zero events;
+# 7d keeps "no data" from masquerading as "broken mapping".
+splunk_verify_window: "-7d"
+
+# --- visibility gate ------------------------------------------------------
+# Minimum RAW event count svc_verify must see for the Sysmon source before any
+# data-quality claim is believable.
+#
+# The first version of this gate counted per-index totals via tstats and passed
+# while the account still could not see raw events -- tstats reads index
+# metadata, the checks read events. The gate now runs the same raw search shape
+# the checks do, so this floor is compared against the same number they depend
+# on.
+#
+# Measured 2026-08-18 over 7 days: ~406,000 Sysmon events. The broken state was
+# 74. A floor of 1000 is unambiguous against both.
+splunk_verify_event_floor: 1000
+
+# Whether a blind verification account FAILS the deploy.
+#
+# True is correct and is the default: shipping a range whose verifier reports
+# green while seeing 0.02% of the data is worse than shipping late, and this is
+# the only place that failure is detectable before someone trusts a result.
+#
+# Set false ONLY to unblock an unrelated deploy while the grant is being fixed.
+# While it is false, every check in section 10 of verify_deployment.sh is
+# unverified -- not passing, unverified. Do not read them as green.
+splunk_verify_fail_on_blind: true

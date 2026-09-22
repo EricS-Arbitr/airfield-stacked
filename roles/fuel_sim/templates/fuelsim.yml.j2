@@ -1,0 +1,65 @@
+# Ansible managed. fuelsim runtime config.
+# Values come from group_vars/fuel.yml -- single source of truth.
+
+modbus_slave:
+  bind:  "{{ fuel_sim_ip }}"
+  port:  {{ fuel_modbus_port }}
+  unit_id: 1
+
+physics:
+  # 500,000 gal tanks; loading rack ~600 gpm typical
+  # tick_hz configurable per user direction 2026-07-16 (default 5).
+  tick_hz: 5
+
+  # Initial tank fill % on boot. `initial_levels_pct` overrides per-tank.
+  default_initial_level_pct: 85.0
+  initial_levels_pct:
+    "T-101": 90.0
+    "T-102": 82.0
+    "T-103": 78.0
+
+  # Interlock switches: T*_LO_LVL trips below lo_pct, T*_HI_LVL above hi_pct.
+  lo_switch_pct: 5.0
+  hi_switch_pct: 95.0
+
+  # Header pressure model: base + running_pumps * per_pump.
+  header_press_base_psi: 20.0
+  header_press_per_pump_psi: 15.0
+
+  # Nominal rack flow when a load is actively dispensing.
+  rack_flow_gpm: 600.0
+
+  # Tank temp is slowly-varying; hold constant for MVP.
+  tank_temp_f: 68.0
+
+  # Seed data mirrored from group_vars/fuel.yml so the sim can boot
+  # without going back to Ansible facts at runtime.
+  tanks_seed: {{ fuel_tanks_seed | to_json }}
+
+replay:
+  timeline: /opt/fuelsim/timelines/fuel_ops_timeline.jsonl
+  seed:     {{ replay_seed }}
+  speed:    {{ replay_speed }}
+  loop:     true
+
+audit_db:
+  host:     "{{ fuel_db_ip }}"
+  port:     5432
+  dbname:   "{{ postgres_db_fuel }}"
+  user:     "{{ postgres_user_fuel_rw }}"
+  password: "{{ postgres_password_fuel_rw }}"
+
+plc:
+  # write LR*_ACTIVE_TRUCK / LR*_SRC_TANK holding regs on the SCADA-bus
+  # image on ff-plc-1 during state transitions
+  host: "{{ fuel_plc_ip }}"
+  port: {{ fuel_modbus_port }}
+
+# Register map -- pulled from group_vars/fuel.yml so the sim and PLC
+# share exactly one address book.
+tag_map:
+  coils: {{ fuel_modbus_coils | to_json }}
+  discrete_inputs: {{ fuel_modbus_discrete_inputs | to_json }}
+  input_registers: {{ fuel_modbus_input_registers | to_json }}
+  holding_registers: {{ fuel_modbus_holding_registers | to_json }}
+totalizer_word_order: "{{ fuel_totalizer_word_order }}"

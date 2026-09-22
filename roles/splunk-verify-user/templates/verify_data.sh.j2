@@ -1,0 +1,355 @@
+#!/bin/bash
+### Managed by Ansible — roles/splunk-verify-user. Do not edit on the host.
+#
+# Runs the Splunk data-quality assertions and prints a single unambiguous
+# token per check. verify_deployment.sh greps for the OK token.
+#
+# The searches live HERE rather than inline in verify_deployment.sh because SPL
+# is full of double quotes that do not survive `ansible -m shell -a "..."`, and
+# because keeping them on the host means the credential is read from a 0600
+# file instead of appearing on the ansible command line or in -v output.
+#
+# 2026-08-18: two defects fixed after this shipped.
+#
+#   1. The Splunk CLI, run as a non-root user, emits ~60 lines of
+#      "Permission denied" trying to write /opt/splunk/var/log. The greps still
+#      matched, but -v output was unreadable. run() now discards stderr.
+#
+#   2. THE IMPORTANT ONE. svc_verify could see 74 of ~406,000 Sysmon events and
+#      every check still returned a clean OK token -- PROC_CIM_OK passed on 13
+#      events, 0.2% of one day. A restricted account returns well-formed tokens
+#      perfectly well, so "the search ran" was being read as "the data is good".
+#      Every token now carries its event count, and check_visibility asserts the
+#      account can see the indexes that hold the data BEFORE any of the
+#      data-quality claims are believable.
+#
+#
+# THE PREDICATE IS `source`, AND THE VALUE HAS NO Xml PREFIX.
+# Measured as admin over REST on ss-pp-stacked, 2026-09-04, before changing it:
+#
+#   search index=sysmon source="WinEventLog:Microsoft-Windows-Sysmon/Operational"
+#     -> 623,448 events
+#
+# Three values are in play and only one of them works here:
+#
+#   source                  WinEventLog:Microsoft-Windows-Sysmon/Operational
+#                           <- what a raw search must filter on
+#   sourcetype (indexed)    XmlWinEventLog:Microsoft-Windows-Sysmon/Operational
+#                           <- what `| tstats ... by sourcetype` reports
+#   sourcetype (search-time) xmlwineventlog
+#                           <- what a raw search would actually compare against,
+#                              because Splunk_TA_windows renames it
+#
+# The original check asked for source="XmlWinEventLog:..." -- the source field
+# with the sourcetype spelling -- and matched nothing against 594,880 events.
+#
+# I THEN BROKE IT FURTHER, and the reason is worth more than the fix. I read
+# the sourcetype from `| tstats count where index=sysmon by source, sourcetype`,
+# saw XmlWinEventLog:... and switched the predicate to sourcetype=. tstats
+# reports the INDEXED value; a raw search filters the SEARCH-TIME value, and a
+# props.conf rename makes those differ. The measurement was taken with a tool
+# that reports something adjacent to what the check uses -- the same class of
+# error as every other one in this file.
+#
+# THE RULE, EARNED TWICE: before changing a search predicate, RUN THE CORRECTED
+# SEARCH and confirm the count. Do not infer it from a different query shape.
+#
+# NOTE ON WHAT STILL FAILS: dns_src and proc_cim gate on EventCode, and
+# EventCode is EMPTY on every event -- the Sysmon add-on extractions are keyed
+# on the pre-rename sourcetype and never fire. Those checks failing now is
+# CORRECT: they are reporting a real normalisation defect rather than a broken
+# query. check_visibility will pass, which is how you tell the two apart.
+# Usage: verify_data.sh {visibility|indexes|whatsee|apps|dns_src|proc_cim|dm_src|dns_server|
+#                       so_zeek|so_suricata|so_strelka|so_hostlogs|all}
+
+set -u
+
+SPLUNK=/opt/splunk/bin/splunk
+AUTH_FILE="{{ splunk_verify_auth_file }}"
+WINDOW="{{ splunk_verify_window }}"
+
+if [ ! -r "$AUTH_FILE" ]; then
+  echo "VERIFY_AUTH_FILE_MISSING"
+  exit 1
+fi
+# NOTE: -auth places the credential in pp-splunk's own process table for the
+# life of the search. Acceptable -- it is a search-only account on the host
+# where splunkd already runs -- but it is why this account is scoped, not admin.
+AUTH="$(cat "$AUTH_FILE")"
+
+if ! command -v curl >/dev/null 2>&1; then
+  echo "VERIFY_CURL_MISSING"
+  exit 1
+fi
+
+# THE SEARCH IS RUN OVER REST, NOT THROUGH `splunk search`.
+#
+# Measured 2026-08-18, and it invalidated four rounds of diagnosis. The same
+# search, same 7-day window, same index, same source:
+#
+#   admin      via Splunk Web   454,659 events
+#   admin      via `splunk search` CLI      85 events
+#   svc_verify via `splunk search` CLI      85 events
+#
+# Same account through two interfaces gives a 5,000x difference; two accounts
+# through the same interface agree exactly. The CLI is the variable and the
+# grant was never broken -- srchIndexesAllowed, srchFilter and srchTimeWin were
+# all ruled out one at a time while the actual cause sat in how the search was
+# being invoked.
+#
+# The lesson is the method, not the setting: every comparison up to that point
+# varied the account AND the interface at once, so none of them could attribute
+# the difference to either. One controlled comparison settled it immediately.
+#
+# REST also removes the reasons the CLI was awkward here: no shell quoting of
+# SPL, no ~60 lines of "Permission denied" on stderr from a non-root caller,
+# and real HTTP status codes instead of a bare exit code.
+run() {
+  # Credentials go in via a curl config on stdin, NOT -u, so they never appear
+  # in pp-splunk's process table.
+  printf 'user = "%s"\n' "$AUTH" | curl -sS -k -K - \
+    --url "https://127.0.0.1:8089/services/search/jobs/export" \
+    --data-urlencode "search=$1" \
+    --data-urlencode "earliest_time=$WINDOW" \
+    --data-urlencode "latest_time=now" \
+    --data-urlencode "output_mode=csv" 2>/dev/null
+}
+
+# --- can this account see the data at all --------------------------------
+# Runs FIRST and gates everything else.
+#
+# 2026-08-18, SECOND ATTEMPT. The first version of this gate used
+# `| tstats count where index=* by index` and PASSED while check_dns_src still
+# returned DNS_NO_EVENTS against 5,922 events that admin could see. tstats
+# reads index metadata; the checks it was supposed to protect run RAW searches.
+# It measured a different thing than the one it claimed to guarantee -- the
+# same transport-vs-outcome mistake it exists to prevent, committed inside the
+# fix for it.
+#
+# It now runs a raw search over the exact source the data-quality checks use,
+# so if svc_verify cannot see those events, this cannot pass.
+check_visibility() {
+  run 'search index=* source="WinEventLog:Microsoft-Windows-Sysmon/Operational"
+       | stats count AS e
+       | eval r=if(e>{{ splunk_verify_event_floor }},
+                   "VISIBILITY_OK_" . e . "_raw_events",
+                   "VISIBILITY_FAIL_" . e . "_raw_events_below_floor_{{ splunk_verify_event_floor }}")
+       | fields r'
+}
+
+# --- which hosts has Splunk actually HEARD FROM ---------------------------
+# Emits one `FWDHOST <lowercased host>` line per host that has sent anything at
+# all. Used by the forwarder-coverage gate in playbooks/75-endpoint.yml, which
+# diffs it against [splunk-forwarder] and fails the deploy on any host that is
+# configured to forward and has sent nothing.
+#
+# index=* on purpose, not index=windows: the forwarder group holds Linux hosts
+# and the SO sensors too, and those write to linux/zeek/suricata. Asking "has
+# this host sent ANYTHING" is the question coverage actually cares about.
+#
+# Raw search rather than tstats, matching check_visibility. tstats bypasses
+# search filters, so a blind account would report every host and the gate would
+# pass while seeing nothing -- the exact failure that version one of the
+# visibility gate had.
+check_fwd_coverage() {
+  # FWDHOST_ with an UNDERSCORE and no space, matching every other token here
+  # (DM_SRC_OK_12_sources, SURICATA_OK_400_events). That convention is not
+  # cosmetic: run() asks for output_mode=csv, and Splunk quotes any field
+  # containing a space. "FWDHOST pp-dc01" came back as
+  #     "FWDHOST pp-dc01"
+  # with the quotes, the consumer parsed zero hosts, and the coverage gate
+  # reported all 51 forwarder targets dark on a range where Splunk was working
+  # -- failing a deploy that had otherwise passed. 2026-09-21.
+  run 'search index=*
+       | stats count AS n by host
+       | eval r="FWDHOST_" . lower(host)
+       | fields r'
+}
+
+# --- what CAN this account see, and from when -----------------------------
+# The diagnostic that discriminates the three ways a grant goes wrong, in one
+# search. Run it when check_visibility fails:
+#
+#   narrow time span   -> an inherited srchTimeWin is clamping the range
+#   few hosts/indexes  -> an inherited srchFilter is restricting events
+#   nothing at all     -> index permissions
+#
+# Deliberately raw, not tstats: tstats bypasses search filters, which is how
+# the first version of the visibility gate passed while the account was blind.
+check_whatsee() {
+  run 'search index=* source="WinEventLog:Microsoft-Windows-Sysmon/Operational"
+       | stats count AS n, min(_time) AS oldest, max(_time) AS newest by index, host
+       | eval oldest=strftime(oldest, "%Y-%m-%d %H:%M:%S"),
+              newest=strftime(newest, "%Y-%m-%d %H:%M:%S")
+       | sort - n'
+}
+
+# --- raw escape hatch ----------------------------------------------------
+# Dumps every index this account can actually see. Not a pass/fail check --
+# it is what you run when check_visibility fails and you need to know WHAT the
+# account sees rather than that it sees too little.
+check_indexes() {
+  run '| tstats count where index=* by index | sort - count'
+}
+
+# --- exactly one Sysmon add-on may be installed --------------------------
+# Two add-ons map the same CIM fields under different attribute names, so
+# Splunk executes both and the conditional EVALs null out the unconditional
+# aliases. See roles/splunk-es/defaults/main.yml.
+check_apps() {
+  run '| rest /services/apps/local
+       | search title=*sysmon*
+       | stats count AS n, values(title) AS apps
+       | eval r=if(n==1, "SYSMON_ADDONS_OK",
+                   "SYSMON_ADDONS_BAD_" . n . "_" . mvjoin(apps, "+"))
+       | fields r'
+}
+
+# --- Sysmon DnsQuery events must carry src -------------------------------
+# EVAL-src in Splunk_TA_microsoft_sysmon covers EventCode 22 explicitly. ES's
+# DNS panels group by src, so an unmapped src blanks every panel while event
+# counts still populate -- which is how this was originally missed.
+check_dns_src() {
+  run 'search index=* source="WinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=22
+       | stats count AS e, count(src) AS s
+       | eval r=case(e==0, "DNS_NO_EVENTS",
+                     s==e, "DNS_SRC_OK_" . e . "_events",
+                     true(), "DNS_SRC_FAIL_" . s . "_of_" . e)
+       | fields r'
+}
+
+# --- ProcessCreate must carry the four fields the two add-ons collided on -
+check_proc_cim() {
+  run 'search index=* source="WinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode=1
+       | stats count AS e, count(process) AS p, count(parent_process_path) AS pp,
+               count(parent_process_guid) AS pg, count(parent_process_id) AS pi
+       | eval r=case(e==0, "PROC_NO_EVENTS",
+                     (p==e AND pp==e AND pg==e AND pi==e), "PROC_CIM_OK_" . e . "_events",
+                     true(), "PROC_CIM_FAIL_p" . p . "_pp" . pp . "_pg" . pg
+                             . "_pi" . pi . "_of" . e)
+       | fields r'
+}
+
+# --- the accelerated data model must actually contain src ----------------
+# Search-time config does NOT retroactively repair summaries built while a
+# mapping was broken, so this can fail while check_dns_src passes. That means
+# the acceleration needs a rebuild, not that the add-ons are wrong.
+#
+# FIELD PATH, 2026-08-18. The first version asked for `Network_Resolution.src`
+# and reported DM_SRC_EMPTY for days against a completely healthy acceleration.
+# tstats qualifies fields by DATASET, not by model, and this model's root
+# dataset is `DNS` -- `Network_Resolution.src` names a dataset that does not
+# exist, so it returned zero rows no matter what the data looked like. It even
+# survived a full acceleration rebuild, because there was nothing to fix.
+#
+# This is the third check in this file whose failure mode was "asks a question
+# that cannot be answered": the visibility gate measured index metadata while
+# guarding raw searches, the DNS check ran through a CLI that truncated, and
+# this one used a field path with no referent. THE RULE THAT WOULD HAVE CAUGHT
+# ALL THREE: before trusting a check to report a bad state, run it against a
+# known-GOOD state and confirm it passes. An assertion that has never returned
+# true is not a check, it is a constant.
+#
+# summariesonly=t is deliberate: this check exists to assert the ACCELERATION
+# specifically. Without it tstats falls back to raw data and would pass while
+# the summaries were empty -- which is the exact condition it is here to catch.
+check_dm_src() {
+  run '| tstats summariesonly=t count from datamodel=Network_Resolution.DNS by DNS.src
+       | stats count AS rows, sum(count) AS events
+       | eval r=if(rows>0, "DM_SRC_OK_" . rows . "_sources_" . events . "_events", "DM_SRC_EMPTY")
+       | fields r'
+}
+
+# --- server-side DNS must be reaching Network_Resolution ------------------
+# Sysmon's DnsQuery event records the querying PROCESS but not which server
+# answered, the message type or the record type -- so Network_Resolution fed by
+# Sysmon alone shows message_type="unknown" and dest="unknown" for 100% of
+# events, and every ES DNS panel filtering on those returns nothing while the
+# key indicators populate. That was the original symptom on this range.
+#
+# The DC debug logs supply what Sysmon cannot. Asserting BOTH message types
+# matters: Query alone would mean the answer side is missing, which is where
+# reply_code and record_type live.
+#
+# VALIDATED AGAINST A KNOWN-GOOD STATE BEFORE SHIPPING, which is the rule the
+# three earlier checks in this file broke. Measured over 24h at the time of
+# writing: Query 16,647 + Response 5,103 = 21,750 across three DCs, so this
+# passes on the current range and is therefore capable of returning true.
+check_dns_server() {
+  run '| tstats summariesonly=t count from datamodel=Network_Resolution.DNS
+         where DNS.message_type!="unknown" by DNS.message_type
+       | stats sum(count) AS e, count AS types
+       | eval r=case(types==0, "DNSSRV_NO_SERVER_EVENTS",
+                     (types>=2 AND e>{{ splunk_verify_event_floor }}),
+                       "DNSSRV_OK_" . e . "_events_" . types . "_types",
+                     true(), "DNSSRV_FAIL_" . e . "_events_" . types . "_types")
+       | fields r'
+}
+
+# --- Security Onion: is each source actually landing in its own index? ----
+# Phase 5 forwards Zeek, Suricata and Strelka from the three sensors into three
+# separate indexes. These assert the OUTCOME -- events present, with counts --
+# rather than that a forwarder process is running. A UF can be up, connected
+# and configured and still deliver nothing, which is what every earlier version
+# of the Sysmon checks in this file managed to miss.
+check_so_zeek() {
+  run 'search index=zeek
+       | stats count AS e
+       | eval r=if(e>{{ splunk_verify_event_floor }},
+                   "ZEEK_OK_" . e . "_events",
+                   "ZEEK_LOW_" . e . "_events_below_floor_{{ splunk_verify_event_floor }}")
+       | fields r'
+}
+
+check_so_suricata() {
+  run 'search index=suricata
+       | stats count AS e
+       | eval r=if(e>0, "SURICATA_OK_" . e . "_events", "SURICATA_NO_EVENTS")
+       | fields r'
+}
+
+# INFORMATIONAL, NEVER FAILS. Strelka analyses files Zeek carves out of
+# traffic. With no user emulation and ~40% mirror packet loss no file is ever
+# complete, so zero is the EXPECTED reading and failing on it would be a
+# standing complaint about a known-open condition -- the same mistake the
+# capture_loss gate made on 2026-09-04. The count is printed so the number is
+# on screen the day it stops being zero.
+check_so_strelka() {
+  run 'search index=strelka
+       | stats count AS e
+       | eval r="STRELKA_" . e . "_events_informational"
+       | fields r'
+}
+
+# THE NEGATIVE REQUIREMENT, asserted rather than assumed.
+# "I do not want any other data or telemetry from these systems sent to
+# splunk." The sensor inputs template skips the /var/log/syslog and auth.log
+# stanzas every other Linux host gets, and this is what proves the skip works.
+# A template conditional that silently stops matching is invisible otherwise --
+# the host would just start shipping its OS logs and nothing would say so.
+check_so_no_host_logs() {
+  run 'search index=linux host=so-sensor-*
+       | stats count AS e
+       | eval r=if(e==0, "SO_HOSTLOGS_CLEAN",
+                   "SO_HOSTLOGS_LEAK_" . e . "_events")
+       | fields r'
+}
+
+case "${1:-all}" in
+  visibility) check_visibility ;;
+  fwd_coverage) check_fwd_coverage ;;
+  so_zeek)      check_so_zeek ;;
+  so_suricata)  check_so_suricata ;;
+  so_strelka)   check_so_strelka ;;
+  so_hostlogs)  check_so_no_host_logs ;;
+  indexes)    check_indexes ;;
+  whatsee)    check_whatsee ;;
+  apps)       check_apps ;;
+  dns_src)    check_dns_src ;;
+  proc_cim)   check_proc_cim ;;
+  dm_src)     check_dm_src ;;
+  dns_server) check_dns_server ;;
+  all)        check_visibility; check_apps; check_dns_src; check_proc_cim; check_dm_src; check_dns_server; \
+              check_so_zeek; check_so_suricata; check_so_strelka; check_so_no_host_logs ;;
+  *)          echo "usage: $0 {visibility|indexes|whatsee|apps|dns_src|proc_cim|dm_src|dns_server|all}"; exit 2 ;;
+esac

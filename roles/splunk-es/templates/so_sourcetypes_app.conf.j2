@@ -1,0 +1,15 @@
+### Managed by Ansible — roles/splunk-es. Do not edit on the host.
+#
+# Minimal app declaration for arbitr_so_sourcetypes. Splunk will merge a bare
+# local/props.conf without this -- `btool` proves it does -- but an app that
+# declares nothing is not properly installed, and the knowledge objects inside
+# it are not reliably visible. Ship the declaration.
+[install]
+state = enabled
+
+[package]
+check_for_updates = false
+
+[ui]
+is_visible = 0
+label = ARBITR Security Onion sourcetypes

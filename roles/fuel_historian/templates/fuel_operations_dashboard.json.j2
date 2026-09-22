@@ -1,0 +1,355 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 0,
+  "id": null,
+  "iteration": 1,
+  "panels": [
+    {
+      "type": "stat",
+      "title": "T-101 Level",
+      "datasource": "InfluxDB-Fuel",
+      "targets": [{
+        "query": "from(bucket: \"{{ influxdb_bucket_fuel }}\") |> range(start: -5m) |> filter(fn: (r) => r._measurement == \"modbus\" and r._field == \"T101_LEVEL\") |> last()",
+        "refId": "A"
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "value": null, "color": "red" },
+              { "value": 5, "color": "orange" },
+              { "value": 20, "color": "green" },
+              { "value": 95, "color": "orange" }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "auto"
+      },
+      "gridPos": { "h": 5, "w": 4, "x": 0, "y": 0 }
+    },
+    {
+      "type": "stat",
+      "title": "T-102 Level",
+      "datasource": "InfluxDB-Fuel",
+      "targets": [{
+        "query": "from(bucket: \"{{ influxdb_bucket_fuel }}\") |> range(start: -5m) |> filter(fn: (r) => r._measurement == \"modbus\" and r._field == \"T102_LEVEL\") |> last()",
+        "refId": "A"
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "value": null, "color": "red" },
+              { "value": 5, "color": "orange" },
+              { "value": 20, "color": "green" },
+              { "value": 95, "color": "orange" }
+            ]
+          }
+        }
+      },
+      "options": { "colorMode": "background", "graphMode": "area", "textMode": "auto" },
+      "gridPos": { "h": 5, "w": 4, "x": 4, "y": 0 }
+    },
+    {
+      "type": "stat",
+      "title": "T-103 Level",
+      "datasource": "InfluxDB-Fuel",
+      "targets": [{
+        "query": "from(bucket: \"{{ influxdb_bucket_fuel }}\") |> range(start: -5m) |> filter(fn: (r) => r._measurement == \"modbus\" and r._field == \"T103_LEVEL\") |> last()",
+        "refId": "A"
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "value": null, "color": "red" },
+              { "value": 5, "color": "orange" },
+              { "value": 20, "color": "green" },
+              { "value": 95, "color": "orange" }
+            ]
+          }
+        }
+      },
+      "options": { "colorMode": "background", "graphMode": "area", "textMode": "auto" },
+      "gridPos": { "h": 5, "w": 4, "x": 8, "y": 0 }
+    },
+    {
+      "type": "gauge",
+      "title": "Header Pressure",
+      "datasource": "InfluxDB-Fuel",
+      "targets": [{
+        "query": "from(bucket: \"{{ influxdb_bucket_fuel }}\") |> range(start: -5m) |> filter(fn: (r) => r._measurement == \"modbus\" and r._field == \"HEADER_PRESS\") |> last()",
+        "refId": "A"
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "pressurepsi",
+          "min": 0,
+          "max": 100,
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "value": null, "color": "blue" },
+              { "value": 15, "color": "green" },
+              { "value": 60, "color": "orange" },
+              { "value": 85, "color": "red" }
+            ]
+          }
+        }
+      },
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 0 }
+    },
+    {
+      "type": "stat",
+      "title": "T-101 Temp",
+      "datasource": "InfluxDB-Fuel",
+      "targets": [{
+        "query": "from(bucket: \"{{ influxdb_bucket_fuel }}\") |> range(start: -5m) |> filter(fn: (r) => r._measurement == \"modbus\" and r._field == \"T101_TEMP\") |> last()",
+        "refId": "A"
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "fahrenheit",
+          "decimals": 1
+        }
+      },
+      "gridPos": { "h": 5, "w": 3, "x": 18, "y": 0 }
+    },
+    {
+      "type": "stat",
+      "title": "ESD Status",
+      "datasource": "InfluxDB-Fuel",
+      "targets": [{
+        "query": "from(bucket: \"{{ influxdb_bucket_fuel }}\") |> range(start: -5m) |> filter(fn: (r) => r._measurement == \"modbus\" and r._field == \"ESD_ACTIVE\") |> last()",
+        "refId": "A"
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "NORMAL", "color": "green" }, "1": { "text": "ESD ACTIVE", "color": "red" } } }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "value": null, "color": "green" },
+              { "value": 1, "color": "red" }
+            ]
+          }
+        }
+      },
+      "options": { "colorMode": "background" },
+      "gridPos": { "h": 5, "w": 3, "x": 21, "y": 0 }
+    },
+    {
+      "type": "stat",
+      "title": "LR-1 Interlocks",
+      "datasource": "InfluxDB-Fuel",
+      "targets": [{
+        "query": "from(bucket: \"{{ influxdb_bucket_fuel }}\") |> range(start: -5m) |> filter(fn: (r) => r._measurement == \"modbus\" and r._field == \"LR1_PERMIT_OUT\") |> last()",
+        "refId": "A"
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "BLOCKED", "color": "red" }, "1": { "text": "PERMITTED", "color": "green" } } }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "value": null, "color": "red" },
+              { "value": 1, "color": "green" }
+            ]
+          }
+        }
+      },
+      "options": { "colorMode": "background" },
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 5 }
+    },
+    {
+      "type": "stat",
+      "title": "LR-1 Load Valve",
+      "datasource": "InfluxDB-Fuel",
+      "targets": [{
+        "query": "from(bucket: \"{{ influxdb_bucket_fuel }}\") |> range(start: -5m) |> filter(fn: (r) => r._measurement == \"modbus\" and r._field == \"LR1_LOAD_VLV\") |> last()",
+        "refId": "A"
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "CLOSED", "color": "text" }, "1": { "text": "OPEN", "color": "green" } } }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "value": null, "color": "text" },
+              { "value": 1, "color": "green" }
+            ]
+          }
+        }
+      },
+      "options": { "colorMode": "background" },
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 5 }
+    },
+    {
+      "type": "stat",
+      "title": "LR-2 Interlocks",
+      "datasource": "InfluxDB-Fuel",
+      "targets": [{
+        "query": "from(bucket: \"{{ influxdb_bucket_fuel }}\") |> range(start: -5m) |> filter(fn: (r) => r._measurement == \"modbus\" and r._field == \"LR2_PERMIT_OUT\") |> last()",
+        "refId": "A"
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "BLOCKED", "color": "red" }, "1": { "text": "PERMITTED", "color": "green" } } }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "value": null, "color": "red" },
+              { "value": 1, "color": "green" }
+            ]
+          }
+        }
+      },
+      "options": { "colorMode": "background" },
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 5 }
+    },
+    {
+      "type": "stat",
+      "title": "LR-2 Load Valve",
+      "datasource": "InfluxDB-Fuel",
+      "targets": [{
+        "query": "from(bucket: \"{{ influxdb_bucket_fuel }}\") |> range(start: -5m) |> filter(fn: (r) => r._measurement == \"modbus\" and r._field == \"LR2_LOAD_VLV\") |> last()",
+        "refId": "A"
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "CLOSED", "color": "text" }, "1": { "text": "OPEN", "color": "green" } } }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "value": null, "color": "text" },
+              { "value": 1, "color": "green" }
+            ]
+          }
+        }
+      },
+      "options": { "colorMode": "background" },
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 5 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Tank Levels (last 1h)",
+      "datasource": "InfluxDB-Fuel",
+      "targets": [{
+        "query": "from(bucket: \"{{ influxdb_bucket_fuel }}\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"modbus\" and (r._field == \"T101_LEVEL\" or r._field == \"T102_LEVEL\" or r._field == \"T103_LEVEL\"))",
+        "refId": "A"
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100
+        }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 10 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Header Pressure + Rack Flows (last 1h)",
+      "datasource": "InfluxDB-Fuel",
+      "targets": [{
+        "query": "from(bucket: \"{{ influxdb_bucket_fuel }}\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"modbus\" and (r._field == \"HEADER_PRESS\" or r._field == \"LR1_FLOW\" or r._field == \"LR2_FLOW\"))",
+        "refId": "A"
+      }],
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 10 }
+    },
+    {
+      "type": "table",
+      "title": "Truck queue (live from fuel_audit.truck_queue)",
+      "datasource": "Postgres-FuelAudit",
+      "targets": [{
+        "rawQuery": true,
+        "rawSql": "SELECT queue_id, truck_id, state, source_tank, rack_position, enqueued_ts, updated_ts FROM truck_queue ORDER BY enqueued_ts DESC LIMIT 20;",
+        "format": "table",
+        "refId": "A"
+      }],
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 18 }
+    },
+    {
+      "type": "table",
+      "title": "Tank levels history (last snap per tank, from tank_level_snap)",
+      "datasource": "Postgres-FuelAudit",
+      "targets": [{
+        "rawQuery": true,
+        "rawSql": "SELECT DISTINCT ON (tank_id) tank_id, level_gal, temp_f, ts FROM tank_level_snap ORDER BY tank_id, ts DESC;",
+        "format": "table",
+        "refId": "A"
+      }],
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 18 }
+    },
+    {
+      "type": "table",
+      "title": "Fuel loaded per truck (last 24h)",
+      "datasource": "Postgres-FuelAudit",
+      "targets": [{
+        "rawQuery": true,
+        "rawSql": "SELECT truck_id, SUM(gallons)::int AS gal_loaded, COUNT(*) AS loads FROM load_txn WHERE start_ts > now() - INTERVAL '24 hours' GROUP BY truck_id ORDER BY gal_loaded DESC;",
+        "format": "table",
+        "refId": "A"
+      }],
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 26 }
+    },
+    {
+      "type": "table",
+      "title": "Aircraft deliveries (last 24h)",
+      "datasource": "Postgres-FuelAudit",
+      "targets": [{
+        "rawQuery": true,
+        "rawSql": "SELECT tail_no, pad_id, SUM(gallons)::int AS gal_delivered, COUNT(*) AS deliveries FROM delivery_txn WHERE start_ts > now() - INTERVAL '24 hours' GROUP BY tail_no, pad_id ORDER BY gal_delivered DESC;",
+        "format": "table",
+        "refId": "A"
+      }],
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 26 }
+    },
+    {
+      "type": "table",
+      "title": "Recent load transactions (last 20)",
+      "datasource": "Postgres-FuelAudit",
+      "targets": [{
+        "rawQuery": true,
+        "rawSql": "SELECT truck_id, tank_id, rack_pos, preset_gal::int, gallons::int AS actual_gal, start_ts, end_ts FROM load_txn ORDER BY end_ts DESC LIMIT 20;",
+        "format": "table",
+        "refId": "A"
+      }],
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 26 }
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["fuel", "ot"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "title": "Fuel Operations",
+  "uid": "fuel-operations",
+  "version": 2
+}
