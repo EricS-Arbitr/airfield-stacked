@@ -20,10 +20,21 @@ PLAYBOOK="site.yml"
 RETRY_FILE="retry/$(basename "${PLAYBOOK%.*}").retry"
 MAX_ATTEMPTS=3
 # FORKS is DERIVED, not chosen: it is the largest single play target plus a
-# small margin. Recomputed 2026-09-15.
+# small margin. Recomputed 2026-09-22 for airfield-stacked.
 #
-#   largest play target : 74  (windows,linux — the `common` play)
+#   largest play target : 72  (splunk-forwarder:!splunk_forwarder_exempt)
+#   next largest        : 69  (the Fleet enrolment play)
+#   then                : 48  (every `windows` play)
 #   FORKS               : 76
+#
+# The widest play CHANGED when Splunk arrived. It was 74 (`windows,linux` for
+# the `common` play) on airfield-range; here the forwarder play is wider than
+# `common` because it spans both OS families minus only the Splunk tier and
+# the SO control plane. 76 still covers it in one batch, so this number is
+# unchanged -- but it is unchanged by coincidence, not because nothing moved.
+#
+# soc-flare left the range and four Splunk VMs joined it, so the host count
+# went 85 -> 88 while the widest play went 74 -> 72.
 #
 # Sized so the widest play runs in ONE batch. At 40 forks that 74-host play
 # ran two rounds, the second only 34 wide, and those are the long plays. The

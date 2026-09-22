@@ -1761,7 +1761,17 @@
 # entire play the moment the variable is deleted, and a skipped play reports as
 # a clean run.
 - name: splunk forwarder
-  hosts: splunk-forwarder
+  # `!splunk_forwarder_exempt` is load-bearing, not tidiness. [splunk-forwarder]
+  # is stated positively as children of [windows] and [linux] so a future host
+  # group inherits telemetry automatically -- which means it also sweeps in the
+  # Splunk tier itself and the SO control plane. Without this exclusion the play
+  # installs a universal forwarder on the indexers (which would forward to
+  # themselves) and on so-manager/so-search, and it would disagree with the
+  # coverage gate in playbooks/75-endpoint.yml, which computes its targets as
+  # [splunk-forwarder] MINUS [splunk_forwarder_exempt]. A play and its gate
+  # disagreeing about who is in scope is how a range ends up with telemetry
+  # nobody asked for and a check that still says everything is fine.
+  hosts: splunk-forwarder:!splunk_forwarder_exempt
   gather_facts: true
   become: true
   roles:
