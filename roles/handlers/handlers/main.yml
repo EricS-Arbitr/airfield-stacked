@@ -55,6 +55,37 @@
   ansible.windows.win_reboot:
     reboot_timeout: 1800
 
+# Splunk handlers. airfield-range removed Splunk entirely when it went
+# Security-Onion-only, so this role arrived here stripped of them while
+# roles/splunk and roles/splunk-es -- copied in from ss-pp-stacked -- still
+# notify them. Measured 2026-09-26: attempt 1 ran 4h31m and then died on
+#   ERROR! The requested handler 'Initialize Splunk' was not found in either
+#   the main handlers list nor in the listening handlers list
+# at splunk : Copy Splunk Installer. `Restart Splunk Service` was missing too and
+# would have ended the next attempt the same way.
+#
+# Copied verbatim from ss-pp-stacked, where this Splunk build is proven.
+- name: Initialize Splunk
+  ansible.builtin.shell: >
+    /opt/splunk/bin/splunk enable boot-start --accept-license --no-prompt
+    --answer-yes --seed-passwd {{ splunk_admin_password }}
+  listen: Initialize Splunk
+  changed_when: false
+
+- name: Start Splunk After Installing and Initializing
+  ansible.builtin.systemd:
+    name: splunk
+    enabled: true
+    state: started
+  register: splunk_status
+  listen: Initialize Splunk
+
+- name: Restart Splunk Service
+  ansible.builtin.systemd:
+    name: splunk
+    state: restarted
+  listen: Restart Splunk Service
+
 - name: reload unbound
   community.docker.docker_container_exec:
     container: "{{ global_dns_container_name }}"
