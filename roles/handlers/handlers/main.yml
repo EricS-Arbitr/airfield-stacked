@@ -112,3 +112,23 @@
   listen: Restart email container
   ansible.builtin.shell: docker restart email
 
+
+# THE OVERLAY MUST BE THE COMPLETE BASE SET. resolve_role_path selects ONE
+# directory, so this file REPLACES range-development-ansible/roles/handlers
+# wholesale -- it never merges. Every handler the base role defines has to be
+# here, or a role copied in later that notifies one aborts the deploy at run
+# time. That is not hypothetical: the Splunk handlers were absent from this file
+# and airfield-stacked ran 4h31m before dying on "The requested handler
+# 'Initialize Splunk' was not found". These two were missing for the same reason
+# and nothing had notified them yet. verify_handlers.py now fails the build
+# instead of the deploy.
+- name: Reload systemd
+  become: true
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Restart network_mgr
+  become: true
+  ansible.builtin.systemd:
+    name: network_mgr.service
+    state: restarted
