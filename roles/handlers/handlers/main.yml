@@ -66,6 +66,12 @@
 #
 # Copied verbatim from ss-pp-stacked, where this Splunk build is proven.
 - name: Initialize Splunk
+  # BOUNDED. The Splunk CLI can spin forever instead of failing: measured
+  # 2026-09-27 on soc-splunk-cm, `splunk list license -auth ...` sat in state R
+  # burning CPU for 18h57m and took a --forks 76 deploy with it. Ansible has no
+  # per-task timeout by default, so nothing ever interrupted it. rc 124 from a
+  # bounded task is a diagnosis; an unbounded one is a dead range.
+  timeout: 600
   ansible.builtin.shell: >
     /opt/splunk/bin/splunk enable boot-start --accept-license --no-prompt
     --answer-yes --seed-passwd {{ splunk_admin_password }}
@@ -73,6 +79,12 @@
   changed_when: false
 
 - name: Start Splunk After Installing and Initializing
+  # BOUNDED. The Splunk CLI can spin forever instead of failing: measured
+  # 2026-09-27 on soc-splunk-cm, `splunk list license -auth ...` sat in state R
+  # burning CPU for 18h57m and took a --forks 76 deploy with it. Ansible has no
+  # per-task timeout by default, so nothing ever interrupted it. rc 124 from a
+  # bounded task is a diagnosis; an unbounded one is a dead range.
+  timeout: 600
   ansible.builtin.systemd:
     name: splunk
     enabled: true
@@ -81,6 +93,12 @@
   listen: Initialize Splunk
 
 - name: Restart Splunk Service
+  # BOUNDED. The Splunk CLI can spin forever instead of failing: measured
+  # 2026-09-27 on soc-splunk-cm, `splunk list license -auth ...` sat in state R
+  # burning CPU for 18h57m and took a --forks 76 deploy with it. Ansible has no
+  # per-task timeout by default, so nothing ever interrupted it. rc 124 from a
+  # bounded task is a diagnosis; an unbounded one is a dead range.
+  timeout: 600
   ansible.builtin.systemd:
     name: splunk
     state: restarted

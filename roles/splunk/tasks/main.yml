@@ -76,6 +76,12 @@
     https_proxy: "https://{{ inet_proxy_addr }}:{{ inet_proxy_port }}"
 
 - name: Check License Status
+  # BOUNDED. The Splunk CLI can spin forever instead of failing: measured
+  # 2026-09-27 on soc-splunk-cm, `splunk list license -auth ...` sat in state R
+  # burning CPU for 18h57m and took a --forks 76 deploy with it. Ansible has no
+  # per-task timeout by default, so nothing ever interrupted it. rc 124 from a
+  # bounded task is a diagnosis; an unbounded one is a dead range.
+  timeout: 300
   ansible.builtin.shell: |
     /opt/splunk/bin/splunk list license -auth "{{ splunk_admin }}:{{ splunk_admin_password }}" 
   register: license_check
@@ -83,6 +89,12 @@
   failed_when: false
 
 - name: Apply Splunk License
+  # BOUNDED. The Splunk CLI can spin forever instead of failing: measured
+  # 2026-09-27 on soc-splunk-cm, `splunk list license -auth ...` sat in state R
+  # burning CPU for 18h57m and took a --forks 76 deploy with it. Ansible has no
+  # per-task timeout by default, so nothing ever interrupted it. rc 124 from a
+  # bounded task is a diagnosis; an unbounded one is a dead range.
+  timeout: 300
   ansible.builtin.shell: >
     /opt/splunk/bin/splunk add license /opt/splunk/etc/licenses/splunk.license
     -auth "{{ splunk_admin }}:{{ splunk_admin_password }}"
@@ -92,12 +104,24 @@
   notify: Restart Splunk Service
 
 - name: Check Index Status
+  # BOUNDED. The Splunk CLI can spin forever instead of failing: measured
+  # 2026-09-27 on soc-splunk-cm, `splunk list license -auth ...` sat in state R
+  # burning CPU for 18h57m and took a --forks 76 deploy with it. Ansible has no
+  # per-task timeout by default, so nothing ever interrupted it. rc 124 from a
+  # bounded task is a diagnosis; an unbounded one is a dead range.
+  timeout: 300
   ansible.builtin.shell: |
     /opt/splunk/bin/splunk list index -auth "{{ splunk_admin }}:{{ splunk_admin_password }}"| grep "^[a-zA-Z]" | cut -f1
   register: existing_indices
   changed_when: false
 
 - name: Create Indices
+  # BOUNDED. The Splunk CLI can spin forever instead of failing: measured
+  # 2026-09-27 on soc-splunk-cm, `splunk list license -auth ...` sat in state R
+  # burning CPU for 18h57m and took a --forks 76 deploy with it. Ansible has no
+  # per-task timeout by default, so nothing ever interrupted it. rc 124 from a
+  # bounded task is a diagnosis; an unbounded one is a dead range.
+  timeout: 300
   ansible.builtin.shell: >
     /opt/splunk/bin/splunk add index "{{ item.name }}"
     -auth "{{ splunk_admin }}:{{ splunk_admin_password }}"
