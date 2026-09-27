@@ -28,7 +28,9 @@
     deb: "{{ staging_dir_linux }}/splunk/splunk.deb"
     state: present
   register: splunk_install
-  notify: Initialize Splunk
+  # NO `notify:` HERE ANY MORE. See "Has splunkd ever run" below: a notify fires
+  # only when apt reports changed, so a re-run over an already-installed Splunk
+  # never initialised it.
 
 - name: Write imits.conf Template
   ansible.builtin.template:
@@ -57,6 +59,49 @@
 # Flush handlers before setting license
 - name: Flush handlers
   ansible.builtin.meta: flush_handlers
+
+# INITIALISATION IS GATED ON THE OUTCOME, NOT ON WHETHER THE INSTALL CHANGED.
+#
+# It used to be a handler notified by `Install Splunk`, which fires only when apt
+# reports changed. MEASURED 2026-09-27 on soc-splunk-cm: the 2026-09-26 attempt
+# installed the .deb and then aborted on the missing `Initialize Splunk` handler,
+# leaving Splunk installed but never initialised. The next run found the install
+# unchanged, so nothing notified, so initialisation never happened -- and every
+# later `splunk` CLI call then blocked on the FIRST-RUN LICENCE PROMPT waiting on a
+# stdin that is not there:
+#
+#   systemctl is-active splunk             inactive
+#   timeout 20 splunk status               rc=124  (even `status`, which needs no auth)
+#   /opt/splunk/var/log/splunk/splunkd.log absent -- splunkd had never run
+#
+# `splunk list license` sat in state R for 18h57m and held a --forks 76 deploy for
+# ~20 hours. Adding the handler was necessary but could not be sufficient: on a
+# host where the install had already happened there was nothing left to notify.
+#
+# splunkd.log is the marker because it is the outcome the next step actually needs
+# -- it exists if and only if splunkd has run at least once. An `installed` check
+# would have passed on exactly the broken host.
+- name: Has splunkd ever run on this host
+  ansible.builtin.stat:
+    path: /opt/splunk/var/log/splunk/splunkd.log
+  register: splunk_ever_started
+
+- name: Accept the licence, enable boot-start and seed the admin password
+  ansible.builtin.shell: >
+    /opt/splunk/bin/splunk enable boot-start --accept-license --no-prompt
+    --answer-yes --seed-passwd {{ splunk_admin_password }}
+  # Bounded: this is the call that accepts the licence, so it is the one most
+  # likely to sit on the prompt if any flag ever stops working.
+  timeout: 600
+  when: not splunk_ever_started.stat.exists
+
+- name: Start Splunk and enable it at boot
+  ansible.builtin.systemd:
+    name: splunk
+    enabled: true
+    state: started
+  timeout: 600
+  when: not splunk_ever_started.stat.exists
 
 - name: Create License Directory
   ansible.builtin.file:
