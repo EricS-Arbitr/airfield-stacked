@@ -10,13 +10,17 @@
 # machine name qualifier: `MACHINE\user`. We use inventory_hostname
 # uppercased because SimSpace's Windows images set Win32_ComputerSystem.Name
 # to the inventory hostname in uppercase.
-heal_local_user: "{{ inventory_hostname | upper }}\\simspace"
+heal_local_user: "{{ inventory_hostname | upper }}\\xadmin"
 # IMPORTANT: hard-code the local password rather than referencing
 # `ansible_password`. Tasks that use this default also set
 # `ansible_password: "{{ heal_local_password }}"` -- which would
 # create a recursive template loop (ansible_password -> heal_local_password
 # -> ansible_password ...) and blow up at recursion depth.
-heal_local_password: "Simspace1!Simspace1!"
+# ConfigingInTheNameOf1! is the 1.2.x image's local xadmin password (and what
+# dcpromo resets the local admin to), so .\xadmin auth reaches a half-promoted
+# child DC. The old MACHINE\simspace probe failed on 1.2.x because simspace is
+# disabled there -- that was the "credentials rejected" seen in child heal.
+heal_local_password: "ConfigingInTheNameOf1!"
 
 # Credential for the parent-forest cleanup (delegated to pdc_blackstone).
 # After Install-ADDSDomain has registered the FOPS crossRef in the

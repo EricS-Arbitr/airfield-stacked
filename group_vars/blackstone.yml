@@ -77,8 +77,8 @@ internal_dns_records:
 # assignments live in the trailing comment so a future AUE / auto-logon
 # role can consume an explicit mapping if needed.
 DomainUsers:
-  - name: "simspace"
-    fullname: "SimSpace Admin"
+  - name: "xadmin"
+    fullname: "xadmin"
     password: "{{ domain_admin_password }}"
     groups: [ "Domain Admins" ]
 

@@ -775,7 +775,7 @@
 # Removes the need for a temporary blackstone.mil\Administrator override
 # in host_vars/fops-dc01.yml on future fresh deploys. See UPSTREAM_FIXES.md
 # 2026-07-14.
-- name: Bootstrap simspace as fops.blackstone.mil Domain Admin (delegated from bs-dc01)
+- name: Bootstrap the domain admin as fops.blackstone.mil Domain Admin (delegated from bs-dc01)
   hosts: pdc_blackstone
   gather_facts: false
   any_errors_fatal: false
@@ -845,8 +845,9 @@
           Services from {{ inventory_hostname }} after
           {{ (bootstrap_child_adws_retries | int) * 15 }}s.
 
-          simspace has NOT been created in the child domain, so anything that
-          authenticates as {{ bootstrap_child_domain }}\simspace will fail.
+          {{ domain_admin }} has NOT been created in the child domain, so
+          anything that authenticates as
+          {{ bootstrap_child_domain }}\{{ domain_admin }} will fail.
 
           Check, in order:
             1. the ADWS service on the child PDC:
@@ -859,18 +860,17 @@
 
     # The child domain comes up with the DEFAULT password policy, complexity
     # ENABLED. Complexity forbids a password that contains the account's own
-    # samAccountName, and domain_admin_password ("Simspace1!Simspace1!")
-    # contains "simspace" -- so creating fops\simspace below is rejected with
-    # "The password does not meet the length, complexity, or history
-    # requirement of the domain". Worse, New-ADUser creates the account and
-    # then fails on the password, leaving simspace DISABLED; the EXISTS branch
-    # on later runs only re-added the group and never healed it, so every
-    # fops member join then failed with "this account is currently disabled".
-    # The PARENT never hits this because create_users disables complexity
-    # before it creates users; the child is bootstrapped here, before
-    # create_users runs, so disable it here too. Lab convention: scenario
-    # passwords are intentionally weak and complexity stays off, same as parent.
-    - name: Relax the child domain password policy before creating simspace
+    # samAccountName. The domain admin is now xadmin / ConfigingInTheNameOf1!
+    # (the released SimSpace convention), and "xadmin" is NOT a substring of
+    # the password, so the admin itself is accepted -- but the scenario users
+    # created later carry the weak lab password and the child is bootstrapped
+    # here, before create_users relaxes policy on it. Disable complexity now,
+    # same as create_users does on the parent, so every account the deploy
+    # creates in the child is accepted. (Historical note: when the admin was
+    # "simspace" / "Simspace1!Simspace1!" the name WAS a substring of the
+    # password, so the admin create itself failed complexity and left the
+    # account disabled -- the rename removes that failure mode outright.)
+    - name: Relax the child domain password policy before creating the domain admin
       ansible.windows.win_shell: |
         $sec = ConvertTo-SecureString "{{ domain_admin_password }}" -AsPlainText -Force
         $cred = New-Object System.Management.Automation.PSCredential(
@@ -894,40 +894,39 @@
       ansible.builtin.fail:
         msg: |
           Could not relax the {{ bootstrap_child_domain }} password policy, so
-          creating {{ bootstrap_child_domain }}\simspace would be rejected for
+          creating accounts in {{ bootstrap_child_domain }} may be rejected for
           complexity.
 
           {{ bootstrap_child_policy.stdout | default('(no output)') | trim }}
       when: (bootstrap_child_policy.rc | default(1)) != 0
 
-    - name: Create simspace in the child domain
+    - name: Create {{ domain_admin }} in the child domain
       ansible.windows.win_shell: |
         $sec = ConvertTo-SecureString "{{ domain_admin_password }}" -AsPlainText -Force
         $cred = New-Object System.Management.Automation.PSCredential(
                   "{{ bootstrap_parent_domain }}\Administrator", $sec)
         $childDomain = "{{ bootstrap_child_domain }}"
         try {
-          $existing = Get-ADUser -Filter "SamAccountName -eq 'simspace'" `
+          $existing = Get-ADUser -Filter "SamAccountName -eq '{{ domain_admin }}'" `
                                  -Server $childDomain -Credential $cred `
                                  -ErrorAction SilentlyContinue
           if (-not $existing) {
-            New-ADUser -Name simspace -SamAccountName simspace `
+            New-ADUser -Name {{ domain_admin }} -SamAccountName {{ domain_admin }} `
                        -AccountPassword $sec -PasswordNeverExpires $true -Enabled $true `
                        -Server $childDomain -Credential $cred
-            Add-ADGroupMember -Identity "Domain Admins" -Members simspace `
+            Add-ADGroupMember -Identity "Domain Admins" -Members {{ domain_admin }} `
                               -Server $childDomain -Credential $cred
             "CREATED"
           } else {
-            # HEAL a half-created account. A fresh run under the old
-            # complexity bug left simspace DISABLED with no usable password;
-            # re-adding the group alone never fixed that, so joins kept failing
-            # with "this account is currently disabled". Reset the password and
-            # enable, then ensure group membership. Idempotent on a good account.
-            Set-ADAccountPassword -Identity simspace -Reset -NewPassword $sec `
+            # HEAL a half-created account: reset the password and enable, then
+            # ensure group membership, so an account left broken by an earlier
+            # run (e.g. disabled, or with a bad password) is repaired rather
+            # than merely re-added to the group. Idempotent on a good account.
+            Set-ADAccountPassword -Identity {{ domain_admin }} -Reset -NewPassword $sec `
                               -Server $childDomain -Credential $cred
-            Set-ADUser -Identity simspace -Enabled $true -PasswordNeverExpires $true `
+            Set-ADUser -Identity {{ domain_admin }} -Enabled $true -PasswordNeverExpires $true `
                               -Server $childDomain -Credential $cred
-            Add-ADGroupMember -Identity "Domain Admins" -Members simspace `
+            Add-ADGroupMember -Identity "Domain Admins" -Members {{ domain_admin }} `
                               -Server $childDomain -Credential $cred `
                               -ErrorAction SilentlyContinue
             "EXISTS"
@@ -953,10 +952,10 @@
 
     # Surfaces stdout ONLY -- never the command. stdout carries the catch
     # block's "FAILED: <exception>"; the command is what carries the secret.
-    - name: Fail if simspace could not be created in the child domain
+    - name: Fail if the domain admin could not be created in the child domain
       ansible.builtin.fail:
         msg: |
-          Creating {{ bootstrap_child_domain }}\simspace failed.
+          Creating {{ bootstrap_child_domain }}\{{ domain_admin }} failed.
 
           {{ bootstrap_simspace.stdout | default('(no output)') | trim }}
 
@@ -966,7 +965,7 @@
 
     - name: Show bootstrap result
       ansible.builtin.debug:
-        msg: "bootstrap_simspace ({{ bootstrap_child_domain }}\\simspace) -> {{ bootstrap_simspace.stdout | trim }}"
+        msg: "bootstrap_simspace ({{ bootstrap_child_domain }}\\{{ domain_admin }}) -> {{ bootstrap_simspace.stdout | trim }}"
       when: bootstrap_simspace.stdout is defined
   tags:
     - dcpromo

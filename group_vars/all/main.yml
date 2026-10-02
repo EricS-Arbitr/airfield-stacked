@@ -8,8 +8,13 @@
 # ============================================================
 
 # --- Domain admin (mirrors customer-base convention) ---------
-domain_admin: "simspace"
-domain_admin_password: "Simspace1!Simspace1!"
+# xadmin / ConfigingInTheNameOf1! matches the released range-development-ansible
+# top-level group_vars (the current SimSpace convention): the 1.2.x image's
+# built-in local admin (xadmin) and the created domain admin share one identity
+# and password, and the account name is NOT a substring of the password, so the
+# Windows complexity rule accepts it everywhere (including the fops child domain).
+domain_admin: "xadmin"
+domain_admin_password: "ConfigingInTheNameOf1!"
 
 # --- Auto-login (shared password across every workstation) ---
 # Per-host `logon_user` in host_vars maps each workstation to its notional

@@ -61,8 +61,8 @@ internal_dns_records:
 # blackstone-range because fops has 12 workstations and we exhausted the
 # PowerPlant list after 33 names (26 spent on blackstone).
 DomainUsers:
-  - name: "simspace"
-    fullname: "SimSpace Admin"
+  - name: "xadmin"
+    fullname: "xadmin"
     password: "{{ domain_admin_password }}"
     groups: [ "Domain Admins" ]
 

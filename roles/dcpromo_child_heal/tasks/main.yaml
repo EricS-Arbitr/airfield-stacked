@@ -227,11 +227,11 @@
   register: heal_reboot_fired
   changed_when: "'REBOOT_QUEUED' in heal_reboot_fired.stdout"
 
-# Wait for the host to come back using DEFAULT (unqualified simspace)
-# credentials. Post-heal the domain hint is empty -- so unqualified
-# `simspace` NTLM resolves to the local SAM correctly, which is exactly
-# what init needs to succeed. No `vars:` override here means this task
-# uses group_vars/windows.yml defaults (ansible_user: simspace).
+# Wait for the host to come back using DEFAULT (unqualified) credentials.
+# Post-heal the domain hint is empty -- so the unqualified image admin NTLM
+# resolves to the local SAM correctly, which is exactly what init needs to
+# succeed. No `vars:` override here means this task uses group_vars/windows.yml
+# defaults (ansible_user: xadmin on the 1.2.x images).
 - name: Wait for reboot to complete on DEFAULT (unqualified) creds
   ansible.builtin.wait_for_connection:
     delay: 60
