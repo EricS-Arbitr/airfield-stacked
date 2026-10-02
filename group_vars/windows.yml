@@ -5,8 +5,14 @@
 ansible_connection: winrm
 ansible_winrm_transport: ntlm
 ansible_port: 5985
-ansible_user: simspace
-ansible_password: Simspace1!Simspace1!
+# xadmin / ConfigingInTheNameOf1! — the 1.2.x Windows image account
+# (Image_Tracker.csv, Base/Micro 1.2.4). Win10/Win11 are 1.2.4, Server 2022 is
+# 1.2.5, and the FLARE analysts (soc-analyst01-06, in [win11]) are Flare 1.2.1;
+# all four ship the same xadmin/ConfigingInTheNameOf1! admin, so one setting
+# covers every [windows] host. The old 1.1.x `simspace` account is disabled on
+# 1.2.x images.
+ansible_user: xadmin
+ansible_password: 'ConfigingInTheNameOf1!'
 
 # Bump WinRM timeouts above the pywinrm defaults (operation=20, read=30).
 # A slow-responding host (e.g. mid-dcpromo, mid-reboot, applying group
@@ -17,7 +23,7 @@ ansible_winrm_operation_timeout_sec: 45
 ansible_winrm_read_timeout_sec: 60
 ansible_python_interpreter: python
 ansible_become_method: runas
-ansible_become_user: simspace
+ansible_become_user: xadmin
 staging_dir_windows: "C:\\temp"
 
 # --- Browsers / Office / EDR helpers -------------------------

@@ -1,0 +1,13 @@
+---
+# ============================================================
+# ubuntu25.yml — RDP Ubuntu Desktop 25 image account override
+# ============================================================
+# bs-eng05, bs-eng06. The 1.2.x Ubuntu Desktop 25 image (1.2.4,
+# Image_Tracker.csv) ships xadmin / PocketFullofShellCod3! — NOT the
+# simspace/simspace1 that group_vars/linux.yml defaults to for the 1.1.0
+# (22.04.5) images. [ubuntu25] is a child of [linux], so these override only
+# the account; ansible_connection and ansible_become_method still come from
+# linux.yml.
+ansible_user: xadmin
+ansible_ssh_pass: 'PocketFullofShellCod3!'
+ansible_become_pass: 'PocketFullofShellCod3!'
