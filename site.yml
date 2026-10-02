@@ -857,6 +857,49 @@
                is still mid-promotion answers DNS but not ADWS
       when: "'CHILD_ADWS_READY' not in (child_adws.stdout | default(''))"
 
+    # The child domain comes up with the DEFAULT password policy, complexity
+    # ENABLED. Complexity forbids a password that contains the account's own
+    # samAccountName, and domain_admin_password ("Simspace1!Simspace1!")
+    # contains "simspace" -- so creating fops\simspace below is rejected with
+    # "The password does not meet the length, complexity, or history
+    # requirement of the domain". Worse, New-ADUser creates the account and
+    # then fails on the password, leaving simspace DISABLED; the EXISTS branch
+    # on later runs only re-added the group and never healed it, so every
+    # fops member join then failed with "this account is currently disabled".
+    # The PARENT never hits this because create_users disables complexity
+    # before it creates users; the child is bootstrapped here, before
+    # create_users runs, so disable it here too. Lab convention: scenario
+    # passwords are intentionally weak and complexity stays off, same as parent.
+    - name: Relax the child domain password policy before creating simspace
+      ansible.windows.win_shell: |
+        $sec = ConvertTo-SecureString "{{ domain_admin_password }}" -AsPlainText -Force
+        $cred = New-Object System.Management.Automation.PSCredential(
+                  "{{ bootstrap_parent_domain }}\Administrator", $sec)
+        try {
+          $d = Get-ADDomain -Server "{{ bootstrap_child_domain }}" -Credential $cred -ErrorAction Stop
+          Set-ADDefaultDomainPasswordPolicy -Identity $d.DistinguishedName `
+            -Server "{{ bootstrap_child_domain }}" -Credential $cred `
+            -ComplexityEnabled $false -MinPasswordLength 1 -ErrorAction Stop
+          "CHILD_POLICY_RELAXED"
+        } catch {
+          "FAILED: $($_.Exception.Message)"
+          throw
+        }
+      register: bootstrap_child_policy
+      changed_when: "'CHILD_POLICY_RELAXED' in bootstrap_child_policy.stdout"
+      no_log: true
+      failed_when: false
+
+    - name: Fail if the child domain password policy could not be relaxed
+      ansible.builtin.fail:
+        msg: |
+          Could not relax the {{ bootstrap_child_domain }} password policy, so
+          creating {{ bootstrap_child_domain }}\simspace would be rejected for
+          complexity.
+
+          {{ bootstrap_child_policy.stdout | default('(no output)') | trim }}
+      when: (bootstrap_child_policy.rc | default(1)) != 0
+
     - name: Create simspace in the child domain
       ansible.windows.win_shell: |
         $sec = ConvertTo-SecureString "{{ domain_admin_password }}" -AsPlainText -Force
@@ -875,6 +918,15 @@
                               -Server $childDomain -Credential $cred
             "CREATED"
           } else {
+            # HEAL a half-created account. A fresh run under the old
+            # complexity bug left simspace DISABLED with no usable password;
+            # re-adding the group alone never fixed that, so joins kept failing
+            # with "this account is currently disabled". Reset the password and
+            # enable, then ensure group membership. Idempotent on a good account.
+            Set-ADAccountPassword -Identity simspace -Reset -NewPassword $sec `
+                              -Server $childDomain -Credential $cred
+            Set-ADUser -Identity simspace -Enabled $true -PasswordNeverExpires $true `
+                              -Server $childDomain -Credential $cred
             Add-ADGroupMember -Identity "Domain Admins" -Members simspace `
                               -Server $childDomain -Credential $cred `
                               -ErrorAction SilentlyContinue
