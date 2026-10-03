@@ -40,7 +40,7 @@
 #                         domain hint that rejects unqualified auth
 # It fails only on a genuinely promoted DC, where there is no local SAM left --
 # and that is the one state where we want to no-op anyway.
-- name: Reach candidate child-DC via local MACHINE\simspace auth
+- name: Reach candidate child-DC via local MACHINE\xadmin auth
   vars:
     ansible_user: "{{ heal_local_user }}"
     ansible_password: "{{ heal_local_password }}"
