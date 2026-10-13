@@ -2050,6 +2050,11 @@
 # to be an agent to reassign.
 - import_playbook: playbooks/80-fleet-integrations.yml
 
+# Malcolm OT deep-packet appliance (soc-malcolm). Independent of the SO grid
+# and Splunk — installs/host-preps/runs the Malcolm stack and brings up its GRE
+# mirror decap for the fuel-farm segments bs-modbus-gateway mirrors to it.
+- import_playbook: playbooks/90-malcolm.yml
+
 # =========================================================================
 # Deferred failure gate
 # =========================================================================

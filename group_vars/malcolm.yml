@@ -1,0 +1,57 @@
+---
+# ============================================================
+# malcolm.yml — soc-malcolm (CISA Malcolm) OT traffic analysis
+# ============================================================
+# Roles: malcolm_host_prep, docker_engine, malcolm (playbooks/90-malcolm.yml).
+# soc-malcolm is in [malcolm] only (NOT [linux]) -- a specialized appliance,
+# like soc-sensor-ot; the common baseline does not run against it. It lives in
+# the SOC subnet (172.31.7.0/24) alongside the analysts and soc-sensor-ot, and
+# monitors the fuel-farm OT that bs-modbus-gateway mirrors to it.
+
+# Zero-egress range: all apt / git / docker-pull traffic goes through the
+# in-platform proxy. ghcr.io is reachable through it.
+malcolm_proxy: "http://{{ inet_proxy_addr }}:{{ inet_proxy_port }}"
+malcolm_no_proxy: "localhost,127.0.0.1"
+docker_engine_proxy: "{{ malcolm_proxy }}"
+
+# Let the image's xadmin run docker directly.
+docker_engine_users:
+  - xadmin
+
+# Data lives on the Expanded image's pre-mounted 500 GB /mnt/Expansion -- no
+# partition/format step (malcolm_host_prep skips the disk when the device is
+# empty), and Malcolm's install + all its relative data paths go there.
+malcolm_host_prep_data_device: ""
+malcolm_install_dir: "/mnt/Expansion/malcolm"
+
+# Live-capture the fuel-farm OT traffic that bs-modbus-gateway gretap-mirrors
+# to this host. No physical SPAN NIC (so malcolm_host_prep_capture_interface
+# stays empty); instead a gretap decap interface, otmir0, is created and the
+# mirror is decapsulated onto it. Setting malcolm_capture_interface flips Zeek,
+# Suricata and netsniff-ng into live mode on that interface.
+malcolm_host_prep_capture_interface: ""
+malcolm_capture_interface: "otmir0"
+
+# GRE mirror decap: frames arrive from bs-modbus-gateway eth0 (172.31.1.18) and
+# are decapsulated onto otmir0. _local is this host's SOC address (eth1) the
+# mirror is aimed at; _remote is the gateway's GRE source.
+malcolm_host_prep_gre_mirror_enabled: true
+malcolm_host_prep_gre_mirror_iface: "otmir0"
+malcolm_host_prep_gre_mirror_local: "172.31.7.30"
+malcolm_host_prep_gre_mirror_remote: "172.31.1.18"
+
+# The VMware customization engine can bring the data NIC up as a /32 with no
+# gateway, which isolates the data plane — no route to the gateway, the GRE
+# mirror source, or the rest of the SOC. soc-malcolm is not in [linux], so
+# nothing else corrects it. Re-assert the real SOC /24 and a default route via
+# the SOC gateway. Mgmt (eth0, 10.255.240.0/20) stays connected and is the
+# Ansible path, unaffected by the default route landing on eth1.
+malcolm_host_prep_dataplane_iface: "eth1"
+malcolm_host_prep_dataplane_cidr: "172.31.7.30/24"
+malcolm_host_prep_dataplane_gateway: "172.31.7.1"
+
+# Authentication (vaulted in group_vars/all/vault.yml).
+malcolm_admin_username: analyst
+malcolm_admin_password: "{{ vault_malcolm_admin_password }}"
+malcolm_arkime_secret: "{{ vault_malcolm_arkime_secret }}"
+malcolm_node_name: "soc-malcolm"

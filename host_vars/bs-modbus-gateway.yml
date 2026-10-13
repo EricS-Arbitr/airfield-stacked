@@ -83,3 +83,24 @@ vyos_gre_tunnel_prefix: 30
 # detections. Rendered as tc `action pass` filters ahead of the catch-all.
 vyos_mirror_exclude_cidrs:
   - "10.255.240.0/20"
+
+# --- Malcolm OT mirror — second gretap fan-out ----------------------------
+# The SAME fuel-farm segments (eth1 Fuel-PLC, eth2 MTU/HMI, eth3 Fuel-Sim) are
+# ALSO mirrored to soc-malcolm (CISA Malcolm) over its own gretap tunnel
+# (tun1), in addition to soc-sensor-ot. Malcolm sits in the SOC subnet
+# (172.31.7.30), reached the same way as the sensor (eth0 172.31.1.18 ->
+# bs-ops-fw -> bs-sec-rtr -> SOC). Its own /30 (10.100.4.x) — distinct from the
+# sensor tunnel's 10.100.3.x. source_interfaces match the primary: all three
+# fuel segments. Malcolm decaps on otmir0 (group_vars/malcolm.yml).
+vyos_mirror_extra_targets:
+  - iface: "tun1"
+    remote_ip: "172.31.7.30"       # soc-malcolm SOC IP
+    source_ip: "172.31.1.18"       # eth0 — same GRE source as the sensor tunnel
+    local_addr: "10.100.4.1"
+    remote_addr: "10.100.4.2"       # documentation only (Malcolm decaps IP-less)
+    prefix: 30
+    description: "so-mirror to soc-malcolm"
+    source_interfaces:
+      - eth1   # Fuel Farm PLC
+      - eth2   # MTU / control-room-hmi
+      - eth3   # Fuel Farm Sim

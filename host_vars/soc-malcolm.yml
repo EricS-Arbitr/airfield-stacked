@@ -1,0 +1,39 @@
+---
+# host_vars/soc-malcolm.yml — CISA Malcolm OT traffic-analysis appliance.
+#
+# SPECIALIZED APPLIANCE, managed by its own roles (docker_engine,
+# malcolm_host_prep, malcolm), NOT the common baseline. In [malcolm] and
+# deliberately NOT in [linux], so group_vars/linux.yml's creds do not apply and
+# the common role does not clobber the image.
+#
+# Lives in the SOC subnet (172.31.7.0/24) beside soc-sensor-ot and the
+# analysts; monitors the fuel-farm OT that bs-modbus-gateway gretap-mirrors to
+# it (eth1 Fuel-PLC, eth2 MTU/HMI, eth3 Fuel-Sim). Same-subnet as the analysts,
+# so UI access needs no firewall rule.
+#
+# Image: RDP_Ubuntu_Desktop_24.04_Expanded:1.2.4 -> xadmin / the Expanded-image
+# password (vault_malcolm_ssh_password). Data lands on the image's 500 GB
+# /mnt/Expansion.
+#
+# Mgmt (eth0, position FIRST) 10.255.240.191; Prod (eth1) SOC 172.31.7.30.
+ansible_host: 10.255.240.191
+ansible_connection: ssh
+ansible_user: xadmin
+ansible_ssh_pass: "{{ vault_malcolm_ssh_password }}"
+ansible_become_method: sudo
+ansible_become_pass: "{{ vault_malcolm_ssh_password }}"
+ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+
+network_interfaces:
+  - name: "eth0"                     # management (position FIRST) — out-of-band
+    ipv4:
+      type: "ethernet"
+      address: "10.255.240.191"
+      netmask: "255.255.240.0"
+      gateway: ""
+  - name: "eth1"                     # production — SOC 172.31.7.0/24
+    ipv4:
+      type: "ethernet"
+      address: "172.31.7.30"
+      netmask: "255.255.255.0"
+      gateway: "172.31.7.1"

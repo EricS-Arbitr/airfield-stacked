@@ -1,0 +1,98 @@
+# --- Data disk ---------------------------------------------------------------
+# Whole disk to partition, format and mount for Malcolm data. Empty skips the
+# disk tasks. The role never reformats an existing filesystem.
+malcolm_host_prep_data_device: ""
+malcolm_host_prep_data_fstype: ext4
+malcolm_host_prep_data_label: malcolm-data
+malcolm_host_prep_data_mount: /data
+malcolm_host_prep_data_mount_opts: defaults,noatime
+
+# Seconds to wait for the apt/dpkg lock (PackageKit, unattended-upgrades).
+malcolm_host_prep_apt_lock_timeout: 600
+
+# --- Kernel tuning (per Malcolm's host configuration docs) ------------------
+malcolm_host_prep_sysctl_file: /etc/sysctl.d/60-malcolm.conf
+malcolm_host_prep_sysctls:
+  vm.max_map_count: 262144
+  vm.swappiness: 1
+  vm.dirty_background_ratio: 40
+  vm.dirty_ratio: 80
+  fs.inotify.max_user_watches: 131072
+  fs.inotify.max_queued_events: 131072
+  fs.inotify.max_user_instances: 512
+  net.core.somaxconn: 65535
+  net.ipv4.tcp_retries2: 5
+
+# --- PAM limits --------------------------------------------------------------
+malcolm_host_prep_limits:
+  - {domain: "*", type: soft, item: nofile, value: 65535}
+  - {domain: "*", type: hard, item: nofile, value: 65535}
+  - {domain: "*", type: soft, item: memlock, value: unlimited}
+  - {domain: "*", type: hard, item: memlock, value: unlimited}
+  - {domain: "*", type: soft, item: nproc, value: 262144}
+  - {domain: "*", type: hard, item: nproc, value: 524288}
+
+# --- Power / desktop ---------------------------------------------------------
+# Mask systemd sleep targets so the host never suspends mid-capture.
+malcolm_host_prep_disable_sleep: true
+# On GNOME hosts, disable idle suspend, screen blank and GNOME Software
+# auto-downloads via a system dconf database. Skipped when GNOME is absent.
+malcolm_host_prep_disable_gnome_idle: true
+
+# --- Package updates ---------------------------------------------------------
+# Turn off APT periodic list refresh and unattended-upgrades so apt never
+# holds the lock or upgrades Docker underneath a running stack.
+malcolm_host_prep_disable_auto_upgrades: true
+
+# --- Capture interface -------------------------------------------------------
+# NIC dedicated to live capture (no IP, promiscuous, offloads off). Managed
+# through NetworkManager. Empty skips capture setup.
+malcolm_host_prep_capture_interface: ""
+malcolm_host_prep_capture_connection: malcolm-capture
+# NetworkManager ethtool features to turn off on the capture NIC.
+malcolm_host_prep_capture_offloads_off:
+  - gro
+  - lro
+  - gso
+  - tso
+  - sg
+  - rxvlan
+  - txvlan
+
+# --- GRE mirror decap interface ----------------------------------------------
+# When this host receives its monitored traffic as a gretap GRE mirror from a
+# router (vyos_mirror) rather than a physical SPAN NIC, create a local gretap
+# tunnel the kernel decapsulates into an IP-less, promiscuous capture
+# interface. Point malcolm_capture_interface at the SAME name to live-capture
+# on it. This is independent of malcolm_host_prep_capture_interface above (that
+# one strips the IP from an existing physical NIC); use one or the other.
+malcolm_host_prep_gre_mirror_enabled: false
+malcolm_host_prep_gre_mirror_iface: otmir0
+# This host's own underlay address the mirror arrives ON (gretap `local`).
+malcolm_host_prep_gre_mirror_local: ""
+# The mirroring router's GRE source address (gretap `remote`). The kernel will
+# NOT decapsulate a packet whose source does not match this exactly.
+malcolm_host_prep_gre_mirror_remote: ""
+malcolm_host_prep_gre_mirror_ttl: 64
+# Decap interface MTU. 1500 to match the mirroring router's tunnel so a full
+# frame is accepted (the kernel's gretap default is 1462).
+malcolm_host_prep_gre_mirror_mtu: 1500
+# Offloads disabled on the decap interface so captured frames reach
+# Zeek/Suricata/netsniff un-coalesced. Applied best-effort — a feature the
+# gretap device does not expose is skipped, not fatal.
+malcolm_host_prep_gre_mirror_offloads_off:
+  - gro
+  - lro
+  - gso
+  - tso
+
+# --- Data-plane interface correction -----------------------------------------
+# Some platform images (VMware customization) bring the data/capture NIC up as
+# a /32 with no gateway, isolating it. Set these to re-assert the correct CIDR
+# and a default route via the subnet gateway through a netplan drop-in that
+# sorts after the platform file. Empty iface skips it entirely. The host must
+# NOT depend on this interface for its Ansible/mgmt path (that stays on eth0).
+malcolm_host_prep_dataplane_iface: ""
+malcolm_host_prep_dataplane_cidr: ""
+malcolm_host_prep_dataplane_gateway: ""
+malcolm_host_prep_dataplane_netplan_file: /etc/netplan/99-zz-malcolm-dataplane.yaml

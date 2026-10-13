@@ -806,3 +806,13 @@ linux
 net
 ot
 infrastructure
+
+# ------------------------------------------------------------
+# Malcolm (CISA) -- OT traffic-analysis appliance in the SOC subnet. Monitors
+# the fuel-farm segments bs-modbus-gateway mirrors to it. Deliberately NOT in
+# [linux]/[range]: a specialized appliance (like soc-sensor-ot) driven by its
+# own roles (docker_engine, malcolm_host_prep, malcolm). Creds/IPs in
+# host_vars/soc-malcolm.yml.
+# ------------------------------------------------------------
+[malcolm]
+soc-malcolm
