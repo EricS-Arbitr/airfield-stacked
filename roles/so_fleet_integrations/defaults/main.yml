@@ -230,11 +230,16 @@ so_fleet_integrations:
     # Both firewalls write the same dataset, so the default `<field>:*` check
     # would pass for bs-ops-fw while bs-edge-fw sent nothing at all.
     verify_query: "observer.hostname:bs-edge-fw"
-    # No seed: the firewalls log continuously, and there is no equivalent of
-    # a wget that would deterministically produce a firewall event.
+    # Seed: a permit-any firewall only filterlogs when a rule has log:true,
+    # which the lab rules now carry (host_vars/bs-edge-fw.yml). bs-www (DMZ,
+    # 172.31.12.3) reaching the internet sim crosses bs-edge-fw DMZ->SWITCH_0,
+    # so the firewall logs a pass with source.ip=bs-www, observer=bs-edge-fw.
+    # The request need not succeed — the logged SYN is what the verify needs.
     seed:
-      host: soc-syslog
-      requests: []
+      host: bs-www
+      requests:
+        - "-O /dev/null http://200.200.200.2/"
+        - "-O /dev/null http://200.200.200.2:8080/"
 
   - policy: so-syslog
     description: "Syslog collector — pfSense firewall logs (bs-ops-fw)"
@@ -255,9 +260,16 @@ so_fleet_integrations:
     verify_datastream: "logs-pfsense.log-{{ so_fleet_namespace }}"
     verify_field: "source.ip"
     verify_query: "observer.hostname:bs-ops-fw"
+    # Seed: the lab rules on bs-ops-fw now log:true (host_vars/bs-ops-fw.yml).
+    # The engineering LAN (172.31.8.0/24) is reachable ONLY through bs-ops-fw,
+    # so soc-syslog -> bs-eng01 (172.31.8.11) crosses it on SWITCH_4 and the
+    # firewall logs a pass with source.ip=soc-syslog, observer=bs-ops-fw. The
+    # request need not succeed — the logged SYN is what the verify needs.
     seed:
       host: soc-syslog
-      requests: []
+      requests:
+        - "-O /dev/null http://172.31.8.11/"
+        - "-O /dev/null http://172.31.8.11:8080/"
 
   # --- VyOS: read the collector's own files ------------------------------
   # filestream READS FILES, so soc-syslog's agent tails

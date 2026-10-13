@@ -55,13 +55,21 @@ pfsense_gateways:
 
 # Lab-mode permit-any rules per data-plane interface. NO blocking ACLs
 # at this stage (CLAUDE.md ops decision — basic routing first, ACLs later).
+# log: true on each so the firewall feeds its filterlog to Security Onion —
+# the SOC wants boundary visibility, and it also gives so_fleet_integrations a
+# deterministic dataset to verify (seeded in so_fleet_integrations). Per-rule
+# `log` is honoured by the pfsense_firewall rule loop, so future ACLs choose
+# individually.
 pfsense_rules:
   - name: "Allow any on SWITCH_0 (lab)"
     interface: "SWITCH_0"
+    log: true
   - name: "Allow any on DMZ (lab)"
     interface: "DMZ"
+    log: true
   - name: "Allow any on SWITCH_1 (lab)"
     interface: "SWITCH_1"
+    log: true
 
 # eBGP (the ONLY BGP session in the fabric) — peers bs-edge-rtr (AS 65002).
 # `redistribute_ospf: true` advertises every corp prefix learned via OSPF
