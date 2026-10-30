@@ -2073,6 +2073,11 @@
 # iterations:  ansible-playbook fuel_farm_playbook.yml
 - import_playbook: fuel_farm_playbook.yml
 
+# ATC subsystem (Flight Control Center): ADS-B feed + radar scope + FDP +
+# weather, plus display shortcuts on the flight workstations. Imported after
+# the OT tier; also runnable standalone:  ansible-playbook atc_playbook.yml
+- import_playbook: atc_playbook.yml
+
 # =========================================================================
 # Deferred failure gate
 # =========================================================================

@@ -101,6 +101,18 @@ fops-flight02
 fops-flight03
 fops-flight04
 
+[atc]
+atc-radar
+atc-station
+atc-weather
+
+# Flight workstations that get an ATC display shortcut/bookmark (Windows).
+[atc_display_clients]
+fops-flight01
+fops-flight02
+fops-flight03
+fops-flight04
+
 [fops_users]
 fops-ops01
 fops-ops02
