@@ -332,8 +332,8 @@ toolset at the hunt position itself. The forensic bench alongside:
 
 ```
 cd /etc/ansible
-wget -q -O ab_mbs.tgz <tarball URL for the pinned commit>
-tar -xzf ab_mbs.tgz
+wget -q -O airfield_full_stack.tgz <tarball URL for the pinned commit>
+tar -xzf airfield_full_stack.tgz
 sudo ./deploy.sh
 ```
 

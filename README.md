@@ -15,4 +15,4 @@ and is the working reference for the Splunk half.
 | Splunk | no | distributed: search head, 2 indexer peers, cluster manager |
 | Endpoint telemetry | Elastic Agent | Elastic Agent **and** universal forwarder |
 | Blueprint | `ARBITR_MB_*.yml` | `ARBITR_MB_STACKED-001.yml` |
-| Tarball | `ab_mb.tgz` | `ab_mbs.tgz` |
+| Tarball | `airfield_seconion.tgz` | `airfield_full_stack.tgz` |
