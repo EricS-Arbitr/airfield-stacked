@@ -357,11 +357,20 @@ The build pulls its install media from the in-platform Nexus
 | Fuel-farm Python packages | `ng_pypi` |
 | HMI `modbus-serial` npm closure | `npm` group |
 | Splunk packages | `ng_raw` |
+| Ubuntu apt packages + fuel DB stack + `docker-ce` | `ng-apt-jammy-prod` / `ng-apt-noble-prod` (`range-registry`) |
 
-apt is the exception: base packages and `docker-ce` install from the Ubuntu
-archive and `download.docker.com` through the proxy. Nexus presents an
-internal-CA certificate, so each fetcher that reaches it is configured to trust
-or skip-verify that host specifically.
+Ubuntu apt packages install from the per-release Nexus repos
+(`ng-apt-jammy-prod` / `ng-apt-noble-prod`, keyed to each host's codename) via
+the `nexus_apt` role, with `archive.ubuntu.com` as a lower-priority fallback.
+That includes the fuel stack's `postgresql-16`, `timescaledb-2-postgresql-16`
+and `telegraf`, and `docker-ce` on both the fuel hosts and the Malcolm
+appliance — all from the Nexus repos rather than their vendor repos. The repos
+are GPG-signed and `range-registry` presents the internal CA, so apt skips TLS
+verification for that host only. Each other fetcher that reaches Nexus is
+likewise configured to trust or skip-verify that host specifically.
+
+One ATC exception remains: `readsb` and `tar1090` are not yet in Nexus, so
+`atc-radar` still fetches them from the internet until they are staged.
 
 ### Verifying
 
