@@ -14,13 +14,12 @@ malcolm_proxy: "http://{{ inet_proxy_addr }}:{{ inet_proxy_port }}"
 malcolm_no_proxy: "localhost,127.0.0.1"
 docker_engine_proxy: "{{ malcolm_proxy }}"
 
-# NEXUS SOURCING (2026-10-21): docker-ce itself still installs from
-# download.docker.com, NOT ng-apt. Nexus hosts a single mixed-release apt repo
-# (jammy+noble+plucky) and plucky's docker-ce outranks noble's, so an apt pin
-# preferring ng-apt pulls the wrong release and breaks dependency resolution.
-# Sourcing docker-ce from Nexus needs per-release apt repos; until then it stays
-# on download.docker.com.
-docker_engine_use_nexus_apt: false
+# NEXUS SOURCING: docker-ce installs from the in-platform Nexus apt repo. The
+# per-release repo (ng-apt-noble-prod) carries Docker CE, so the mixed-release
+# blocker that forced this false (plucky's docker-ce outranking noble's in the
+# old single ng-apt repo) no longer applies. The `nexus_apt` role writes the
+# per-release source + pin on this host before docker_engine.
+docker_engine_use_nexus_apt: true
 
 # NEXUS SOURCING: Malcolm 26.08.0 source + images from Nexus. (These are a raw
 # tarball + a docker registry, NOT apt, so the mixed-release apt problem above
