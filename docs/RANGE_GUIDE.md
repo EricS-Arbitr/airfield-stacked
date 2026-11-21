@@ -11,6 +11,9 @@ distributed Security Onion grid and a distributed Splunk cluster — plus a
 Malcolm appliance for OT deep-packet analysis. Endpoints feed both SIEMs; the
 host and device log sources reach both as well.
 
+For scenario framing, cyber key-terrain tiering and the intentional-vulnerability
+catalogue, see [`SCENARIO_AND_KEY_TERRAIN.md`](SCENARIO_AND_KEY_TERRAIN.md).
+
 ---
 
 ## At a glance
